@@ -523,24 +523,40 @@ function cactusGeo(v: number): CactusGeo {
   return g;
 }
 
-/** A single tapered, gently curved frond along +x, from root to length 1. */
+/**
+ * One pinnate frond along +x: a curved spine with a tapered, saw-toothed
+ * half-width profile so the edge reads as leaflets.
+ */
 function frond(p: Path2D, a: number, len: number, w: number, bend: number): void {
   const c = Math.cos(a);
   const s = Math.sin(a);
-  const T = (x: number, y: number): [number, number] => [x * c - y * s, x * s + y * c];
-  const [x0, y0] = T(0.08, 0);
-  const [x1, y1] = T(len * 0.4, -w + bend * 0.4);
-  const [x2, y2] = T(len, bend);
-  const [x3, y3] = T(len * 0.45, w + bend * 0.55);
-  const [c1x, c1y] = T(len * 0.15, -w * 0.9);
-  const [c2x, c2y] = T(len * 0.8, -w * 0.6 + bend * 0.8);
-  const [c3x, c3y] = T(len * 0.8, w * 0.55 + bend * 0.9);
-  const [c4x, c4y] = T(len * 0.15, w * 0.9);
+  const N = 16;
+  const teeth = 7;
+  const pt = (t: number, side: number): [number, number] => {
+    const sx = 0.06 + t * (len - 0.06);
+    const sy = bend * t * t;
+    // Spine normal (derivative of the spine curve).
+    const dx = len - 0.06;
+    const dy = 2 * bend * t;
+    const dl = Math.hypot(dx, dy);
+    const nx = -dy / dl;
+    const ny = dx / dl;
+    const saw = 1 - 0.38 * ((t * teeth + (side > 0 ? 0.5 : 0)) % 1);
+    const hw = w * Math.sin(Math.PI * Math.pow(t, 0.75)) * (t > 0.08 ? saw : 1);
+    const x = sx + nx * hw * side;
+    const y = sy + ny * hw * side;
+    return [x * c - y * s, x * s + y * c];
+  };
+  const [x0, y0] = pt(0, 1);
   p.moveTo(x0, y0);
-  p.quadraticCurveTo(c1x, c1y, x1, y1);
-  p.quadraticCurveTo(c2x, c2y, x2, y2);
-  p.quadraticCurveTo(c3x, c3y, x3, y3);
-  p.quadraticCurveTo(c4x, c4y, x0, y0);
+  for (let i = 1; i <= N; i++) {
+    const [x, y] = pt(i / N, 1);
+    p.lineTo(x, y);
+  }
+  for (let i = N - 1; i >= 0; i--) {
+    const [x, y] = pt(i / N, -1);
+    p.lineTo(x, y);
+  }
   p.closePath();
 }
 
@@ -559,18 +575,18 @@ function palmGeo(v: number): PalmGeo {
     const k = isBack ? i / 2 : (i - 1) / 2;
     const a = off + (k / n) * TAU + (isBack ? 0 : Math.PI / n) + (r() - 0.5) * 0.25;
     if (!isBack && k % 2 === 1 && n > 6) continue;
-    const len = isBack ? 0.94 + r() * 0.08 : 0.72 + r() * 0.12;
-    const w = isBack ? 0.21 : 0.18;
-    const bend = (isBack ? 0.13 : 0.1) + r() * 0.08;
+    const len = isBack ? 0.94 + r() * 0.08 : 0.74 + r() * 0.12;
+    const w = isBack ? 0.2 : 0.17;
+    const bend = (isBack ? 0.16 : 0.12) + r() * 0.08;
     frond(isBack ? back : front, a, len, w, bend);
     frond(all, a, len, w, bend);
     const c = Math.cos(a);
     const s = Math.sin(a);
     ribs.moveTo(c * 0.1, s * 0.1);
-    const mx = len * 0.55;
-    const my = bend * 0.55;
-    const ex = len * 0.94;
-    const ey = bend * 0.96;
+    const mx = 0.06 + (len - 0.06) * 0.5;
+    const my = 0;
+    const ex = len * 0.92;
+    const ey = bend * 0.85;
     ribs.quadraticCurveTo(mx * c - my * s, mx * s + my * c, ex * c - ey * s, ex * s + ey * c);
   }
   g = { back, front, ribs, all };
@@ -1047,7 +1063,13 @@ function drawPalm(ctx: CanvasRenderingContext2D, x: number, y: number, r: number
   ctx.lineTo(x + sx, y + sy);
   ctx.stroke();
   ctx.restore();
-  shadowOf(ctx, T, g.all, x + dx, y, r, rot, sx, sy);
+  ctx.save();
+  ctx.translate(x + dx + sx, y + sy);
+  ctx.rotate(rot);
+  ctx.scale(r * 1.02, r * 1.02);
+  ctx.fillStyle = T.shadeB;
+  ctx.fill(g.all);
+  ctx.restore();
   ctx.translate(x + dx, y);
   ctx.scale(r, r);
   ctx.rotate(rot);
