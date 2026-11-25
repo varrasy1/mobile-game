@@ -169,6 +169,76 @@ export class AudioEngine {
     this.noiseGain.gain.setTargetAtTime(level, now, 0.08);
   }
 
+  private scale(step: number): number {
+    const n = PENTATONIC.length;
+    const octave = Math.floor(step / n);
+    return PENTATONIC[((step % n) + n) % n] * Math.pow(2, Math.max(-1, Math.min(1, octave)));
+  }
+
+  /** Short glassy pluck (orb pickups climb the scale within a chain). */
+  blip(step: number, level = 0.07): void {
+    if (!this.ctx || !this.master || !this.send) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime + 0.002;
+    const f = this.scale(step + 5);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, t);
+    env.gain.linearRampToValueAtTime(level, t + 0.006);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+    env.connect(this.master);
+    env.connect(this.send);
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.value = f;
+    o.connect(env);
+    o.start(t);
+    o.stop(t + 0.3);
+    o.onended = () => env.disconnect();
+  }
+
+  /** Airy whoosh with a soft low thump. */
+  boost(): void {
+    if (!this.ctx || !this.master) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime + 0.002;
+    const src = ctx.createBufferSource();
+    src.buffer = this.pinkNoise(ctx, 1);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 2.5;
+    bp.frequency.setValueAtTime(300, t);
+    bp.frequency.exponentialRampToValueAtTime(2400, t + 0.5);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.35, t + 0.08);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+    src.connect(bp).connect(g).connect(this.master);
+    src.start(t);
+    src.stop(t + 1);
+
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(110, t);
+    o.frequency.exponentialRampToValueAtTime(55, t + 0.35);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.linearRampToValueAtTime(0.22, t + 0.02);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
+    o.connect(og).connect(this.master);
+    o.start(t);
+    o.stop(t + 0.45);
+  }
+
+  /** Warm major chord — sector reached. */
+  chord(): void {
+    [0, 2, 4, 6].forEach((step, i) => setTimeout(() => this.chime(step), i * 70));
+  }
+
+  /** Gentle falling phrase — the run fades out. */
+  fadeOut(): void {
+    [7, 5, 3, 0].forEach((step, i) => setTimeout(() => this.chime(step), i * 160));
+  }
+
   /** Soft bell / e-piano note stepping up the C-major pentatonic scale. */
   chime(step: number): void {
     if (!this.ctx || !this.master || !this.send) return;

@@ -107,6 +107,159 @@
         opacity: 1;
         transform: none;
       }
+      #streak.bump {
+        animation: bump 260ms var(--ease);
+      }
+      @keyframes bump {
+        0% {
+          transform: scale(1.18);
+        }
+        100% {
+          transform: none;
+        }
+      }
+      #flow {
+        width: 92px;
+        height: 3px;
+        margin-top: 10px;
+        border-radius: 2px;
+        background: color-mix(in srgb, var(--fg) 14%, transparent);
+        overflow: hidden;
+      }
+      #flow-fill {
+        height: 100%;
+        background: var(--fg);
+        opacity: 0.7;
+        transform-origin: left center;
+        transition: background-color 300ms var(--ease);
+      }
+      #flow.low #flow-fill {
+        background: var(--accent);
+        opacity: 1;
+        animation: lowpulse 0.8s ease-in-out infinite;
+      }
+      @keyframes lowpulse {
+        50% {
+          opacity: 0.35;
+        }
+      }
+      .center-note {
+        position: fixed;
+        left: 0;
+        right: 0;
+        text-align: center;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 300ms var(--ease), transform 300ms var(--ease);
+      }
+      #drift {
+        bottom: calc(env(safe-area-inset-bottom) + 40px);
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.2em;
+        font-variant-numeric: tabular-nums;
+        transform: translateY(6px);
+      }
+      #drift.show {
+        opacity: 0.85;
+        transform: none;
+      }
+      #banner {
+        top: 26%;
+        font-size: 15px;
+        font-weight: 500;
+        letter-spacing: 0.5em;
+        margin-right: -0.5em;
+        color: var(--accent);
+        transform: scale(0.96);
+      }
+      #banner.show {
+        opacity: 1;
+        transform: none;
+      }
+      #hint {
+        bottom: calc(env(safe-area-inset-bottom) + 84px);
+        font-size: 12px;
+        line-height: 1.7;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      #hint.show {
+        opacity: 0.7;
+      }
+      #results {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        pointer-events: none;
+        opacity: 0;
+        transform: translateY(8px);
+        transition: opacity 450ms var(--ease), transform 450ms var(--ease);
+        text-align: center;
+        padding-bottom: 12vh;
+        text-shadow: 0 0 14px var(--bg), 0 0 4px var(--bg);
+      }
+      #results.show {
+        opacity: 1;
+        transform: none;
+      }
+      .r-label {
+        font-size: 11px;
+        letter-spacing: 0.4em;
+        margin-right: -0.4em;
+        opacity: 0.6;
+      }
+      .r-best {
+        color: var(--accent);
+        opacity: 1;
+      }
+      .r-score {
+        font-size: clamp(44px, 15vw, 64px);
+        font-weight: 300;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+        text-shadow: 0 1px 24px var(--bg);
+      }
+      .r-stats {
+        display: grid;
+        grid-template-columns: repeat(4, auto);
+        gap: 22px;
+        margin-top: 4px;
+      }
+      .r-stats div {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .r-stats b {
+        font-size: 16px;
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+      }
+      .r-stats span {
+        font-size: 9px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        opacity: 0.5;
+      }
+      .r-sub {
+        font-size: 11px;
+        letter-spacing: 0.24em;
+        text-transform: uppercase;
+        opacity: 0.45;
+        min-height: 1em;
+      }
+      .r-prompt {
+        margin-top: 22px;
+        font-size: 12px;
+        letter-spacing: 0.24em;
+        text-transform: uppercase;
+        animation: pulse 2.4s var(--ease) infinite;
+      }
       .controls {
         position: absolute;
         top: calc(env(safe-area-inset-top) + 12px);
@@ -216,9 +369,15 @@
       <div id="prompt">Tap anywhere to drive</div>
     </div>
 
+    <div id="drift" class="center-note"></div>
+    <div id="banner" class="center-note"></div>
+    <div id="hint" class="center-note">Hold left / right to shift your line<br />Follow the lights · clip the apex</div>
+    <div id="results" aria-live="polite"></div>
+
     <div id="hud">
       <div class="readout">
         <div id="score">0</div>
+        <div id="flow"><div id="flow-fill"></div></div>
         <div id="streak">2x FLOW</div>
       </div>
       <div class="controls">

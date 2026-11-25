@@ -9,33 +9,16 @@ permissions:
   contents: read
   pages: write
   id-token: write
-  actions: write
 
 concurrency:
-  group: pages-${{ github.ref_name }}
+  group: pages
   cancel-in-progress: true
 
 jobs:
-  # The github-pages environment only accepts deployments from the repository's
-  # default branch. If main is not (yet) the default branch, hand the run over
-  # to the default branch; it still builds and deploys main's content.
-  route:
-    if: github.ref_name != github.event.repository.default_branch
-    runs-on: ubuntu-latest
-    steps:
-      - run: gh workflow run deploy.yml --repo "$REPO" --ref "$DEFAULT_BRANCH"
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-
   build:
-    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main
       - uses: actions/setup-node@v4
         with:
           node-version: 22

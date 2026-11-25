@@ -2,6 +2,8 @@ import { ROAD_HALF_WIDTH, type Track, type TrackQuery } from './track';
 
 export const BASE_SPEED = 280;
 export const MAX_SPEED = 460;
+/** Absolute cap including sector progression and boosts. */
+export const TOP_SPEED = 520;
 
 const STEER_SMOOTHING = 14;
 const LATERAL_GRIP = 5.2;
@@ -30,8 +32,8 @@ export class Car {
   }
 
   get turnRate(): number {
-    const hi = Math.min(1, Math.max(0, (this.speed - BASE_SPEED) / (MAX_SPEED - BASE_SPEED)));
-    return 2.7 - 0.55 * hi; // slightly gentler at ultra-high speed
+    const hi = Math.min(1, Math.max(0, (this.speed - BASE_SPEED) / (TOP_SPEED - BASE_SPEED)));
+    return 2.85 - 0.1 * hi; // slightly gentler at top speed, still enough for the tightest bend
   }
 
   update(dt: number, steerInput: number, targetSpeed: number): void {
@@ -72,21 +74,33 @@ export class Car {
 
 const wrap = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
 
-/** Title-screen autopilot: pure pursuit toward a racing line that hugs apexes. */
-export function autopilotSteer(car: Car, track: Track, q: TrackQuery): number {
+/**
+ * Line-following controller (Stanley-style, tuned by simulation): steer the
+ * travel direction along the road tangent, corrected by the predicted lateral
+ * error to the chosen line, plus curvature feed-forward. The error is measured
+ * against a blend of facing and velocity angle, which removes most of the
+ * grip lag — the car tracks the line without oscillating, yet still carves
+ * and slips physically.
+ */
+export function followSteer(car: Car, track: Track, q: TrackQuery, offset: number, gain = 4): number {
   const v = car.speed;
-  const look = 70 + v * 0.42;
-  const kAhead = track.curvatureAt(q.s + look * 0.6);
-  const offset = Math.max(-1, Math.min(1, kAhead / 0.004)) * (ROAD_HALF_WIDTH - 26);
-  const p = track.poseAt(q.s + look);
+  const p = track.poseAt(q.s + v * 0.08);
   if (!p) return 0;
-  const tx = p.x + p.nx * offset;
-  const ty = p.y + p.ny * offset;
-  const desired = Math.atan2(ty - car.y, tx - car.x);
   const velAngle = Math.atan2(car.vy, car.vx);
-  const err = wrap(desired - velAngle);
-  const ff = (track.curvatureAt(q.s) * v) / car.turnRate;
-  return Math.max(-1, Math.min(1, ff + err * 2.2));
+  const latVel = v * Math.sin(wrap(velAngle - p.angle));
+  const e = offset - (q.lateral + latVel * 0.4);
+  const desired = p.angle + Math.atan2(3.2 * e, v + 40);
+  const base = car.angle - wrap(car.angle - velAngle) * 0.5;
+  const ff = (track.curvatureAt(q.s + v * 0.1) * v) / car.turnRate;
+  return Math.max(-1, Math.min(1, ff + wrap(desired - base) * gain));
+}
+
+/** Title / demo autopilot: follows a racing line that hugs the apexes. */
+export function autopilotSteer(car: Car, track: Track, q: TrackQuery): number {
+  const look = 70 + car.speed * 0.42;
+  const kAhead = track.curvatureAt(q.s + look * 0.6);
+  const offset = Math.max(-1, Math.min(1, kAhead / 0.004)) * (ROAD_HALF_WIDTH - 22);
+  return followSteer(car, track, q, offset, 3);
 }
 
 // ───────────────────────── input ─────────────────────────
@@ -98,23 +112,58 @@ const KEY_DIRS: Record<string, number> = {
   KeyD: 1,
 };
 
+/** Drag distance (CSS px) for full lock in drag mode. */
+const DRAG_RANGE = 54;
+/** Movement that turns a hold into a drag. */
+const DRAG_THRESHOLD = 12;
+/** Hold steering ramps from a gentle nudge to full lock over this time. */
+const HOLD_RAMP_S = 0.32;
+const HOLD_MIN = 0.32;
+
+interface Pointer {
+  startX: number;
+  x: number;
+  t0: number;
+  drag: boolean;
+  anchor: number;
+  /** Last value this pointer produced (for seamless hold → drag hand-over). */
+  value: number;
+}
+
+const holdValue = (side: number, t0: number, now: number): number =>
+  side * Math.min(1, HOLD_MIN + ((now - t0) / 1000 / HOLD_RAMP_S) * (1 - HOLD_MIN));
+
 /**
- * Touch: every active touch lives in an insertion-ordered Map keyed by
- * Touch.identifier, so the most recently added finger always wins.
- * Desktop: arrow keys / A-D (most recent key wins) plus mouse halves.
+ * Two ways to steer, decided per finger:
+ *  • Hold left / right half → steering ramps in smoothly (short taps = small
+ *    corrections, long holds = full lock).
+ *  • Drag horizontally → analogue "floating stick": steer follows the thumb
+ *    offset, re-anchoring at the ends so reversing responds instantly.
+ * Touches live in an insertion-ordered Map keyed by Touch.identifier; the most
+ * recently added finger always wins. Keys (←/A, →/D) use the hold ramp.
  */
 export class InputController {
-  private touches = new Map<number, number>();
+  private touches = new Map<number, Pointer>();
   private ignored = new Set<number>();
-  private keys = new Map<string, number>();
-  private mouseX: number | null = null;
+  private keys = new Map<string, { dir: number; t0: number }>();
+  private mouse: Pointer | null = null;
   private mouseIgnored = false;
+  /** True once the player has used drag steering (for the hint text). */
+  usedDrag = false;
 
   constructor(
     target: HTMLElement,
     private readonly onGesture: () => void,
   ) {
     const opts: AddEventListenerOptions = { passive: false };
+    const newPointer = (x: number): Pointer => ({
+      startX: x,
+      x,
+      t0: performance.now(),
+      drag: false,
+      anchor: x,
+      value: 0,
+    });
 
     target.addEventListener(
       'touchstart',
@@ -122,7 +171,7 @@ export class InputController {
         e.preventDefault();
         for (const t of Array.from(e.changedTouches)) {
           this.touches.delete(t.identifier);
-          this.touches.set(t.identifier, t.clientX);
+          this.touches.set(t.identifier, newPointer(t.clientX));
         }
         this.onGesture();
       },
@@ -133,7 +182,8 @@ export class InputController {
       (e) => {
         e.preventDefault();
         for (const t of Array.from(e.changedTouches)) {
-          if (this.touches.has(t.identifier)) this.touches.set(t.identifier, t.clientX);
+          const p = this.touches.get(t.identifier);
+          if (p) this.move(p, t.clientX);
         }
       },
       opts,
@@ -150,15 +200,15 @@ export class InputController {
 
     target.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
-      this.mouseX = e.clientX;
+      this.mouse = newPointer(e.clientX);
       this.mouseIgnored = false;
       this.onGesture();
     });
     window.addEventListener('mousemove', (e) => {
-      if (this.mouseX !== null) this.mouseX = e.clientX;
+      if (this.mouse) this.move(this.mouse, e.clientX);
     });
     window.addEventListener('mouseup', () => {
-      this.mouseX = null;
+      this.mouse = null;
       this.mouseIgnored = false;
     });
     target.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -171,7 +221,7 @@ export class InputController {
         e.preventDefault();
         if (!e.repeat) {
           this.keys.delete(e.code);
-          this.keys.set(e.code, dir);
+          this.keys.set(e.code, { dir, t0: performance.now() });
         }
       }
       if (!e.repeat) this.onGesture();
@@ -182,23 +232,47 @@ export class InputController {
     window.addEventListener('blur', () => this.reset());
   }
 
-  /** Current raw steering input: −1, 0 or +1. */
+  private move(p: Pointer, x: number): void {
+    p.x = x;
+    if (!p.drag && Math.abs(x - p.startX) > DRAG_THRESHOLD) {
+      p.drag = true;
+      this.usedDrag = true;
+      p.anchor = x - p.value * DRAG_RANGE;
+    }
+    if (p.drag) {
+      if (x - p.anchor > DRAG_RANGE) p.anchor = x - DRAG_RANGE;
+      else if (x - p.anchor < -DRAG_RANGE) p.anchor = x + DRAG_RANGE;
+    }
+  }
+
+  private pointerValue(p: Pointer, now: number): number {
+    if (p.drag) p.value = Math.max(-1, Math.min(1, (p.x - p.anchor) / DRAG_RANGE));
+    else p.value = holdValue(p.startX < window.innerWidth * 0.5 ? -1 : 1, p.t0, now);
+    return p.value;
+  }
+
+  /** Current analogue steering input, −1…1. */
   get steer(): number {
-    let touchX: number | null = null;
-    for (const [id, x] of this.touches) if (!this.ignored.has(id)) touchX = x;
-    if (touchX !== null) return touchX < window.innerWidth * 0.5 ? -1 : 1;
+    const now = performance.now();
+    let active: Pointer | null = null;
+    for (const [id, p] of this.touches) if (!this.ignored.has(id)) active = p;
+    if (active) return this.pointerValue(active, now);
+    if (this.mouse && !this.mouseIgnored) return this.pointerValue(this.mouse, now);
+    let key: { dir: number; t0: number } | null = null;
+    for (const k of this.keys.values()) key = k;
+    return key ? holdValue(key.dir, key.t0, now) : 0;
+  }
 
-    if (this.mouseX !== null && !this.mouseIgnored) return this.mouseX < window.innerWidth * 0.5 ? -1 : 1;
-
-    let dir = 0;
-    for (const d of this.keys.values()) dir = d;
-    return dir;
+  /** Whether the player is actively steering right now. */
+  get active(): boolean {
+    for (const id of this.touches.keys()) if (!this.ignored.has(id)) return true;
+    return (this.mouse !== null && !this.mouseIgnored) || this.keys.size > 0;
   }
 
   /** The gesture that starts a run should not also yank the wheel. */
   consumeActive(): void {
     for (const id of this.touches.keys()) this.ignored.add(id);
-    if (this.mouseX !== null) this.mouseIgnored = true;
+    if (this.mouse) this.mouseIgnored = true;
     this.keys.clear();
   }
 
@@ -206,6 +280,6 @@ export class InputController {
     this.touches.clear();
     this.ignored.clear();
     this.keys.clear();
-    this.mouseX = null;
+    this.mouse = null;
   }
 }

@@ -1,12 +1,14 @@
-import { BASE_SPEED, MAX_SPEED, type Car } from './car';
+import { BASE_SPEED, MAX_SPEED, TOP_SPEED, type Car } from './car';
 import { css, type Palette, type Theme } from './theme';
-import type { Track } from './track';
+import { NODE_SPACING, type Track } from './track';
 
 const DPR_CAP = 2.5;
 const TRAIL_LIFE = 1.6;
 const DUST_LIFE = 0.8;
 const RIPPLE_LIFE = 1.0;
 const MAX_DUST = 140;
+const POPUP_LIFE = 1.1;
+const STREAK_COUNT = 28;
 
 export interface GhostPose {
   x: number;
@@ -36,7 +38,30 @@ interface Ripple {
   x: number;
   y: number;
   age: number;
+  big: boolean;
 }
+
+interface Popup {
+  x: number;
+  y: number;
+  text: string;
+  age: number;
+  accent: boolean;
+  size: number;
+}
+
+interface Streak {
+  x: number;
+  y: number;
+}
+
+export interface FrameFx {
+  /** 0…1 boost intensity. */
+  boost: number;
+  time: number;
+}
+
+type View = { l: number; r: number; t: number; b: number };
 
 export class Renderer {
   private readonly ctx: CanvasRenderingContext2D;
@@ -61,6 +86,9 @@ export class Renderer {
   private trailing = false;
   private dust: Dust[] = [];
   private ripples: Ripple[] = [];
+  private popups: Popup[] = [];
+  private streaks: Streak[] = [];
+  private shake = 0;
 
   // Scratch buffers for the visible road strip.
   private lx: number[] = [];
@@ -110,11 +138,14 @@ export class Renderer {
 
   // ───────────────────────── camera ─────────────────────────
 
-  updateCamera(dt: number, car: Car): void {
+  updateCamera(dt: number, car: Car, boost: number): void {
     const tx = car.x + car.vx * 0.32;
     const ty = car.y + car.vy * 0.32;
     const speed = car.speed;
-    const targetZoom = Math.min(1.04, Math.max(0.88, 1.04 - ((speed - BASE_SPEED) / (MAX_SPEED - BASE_SPEED)) * 0.14));
+    const base = Math.min(1.04, Math.max(0.88, 1.04 - ((speed - BASE_SPEED) / (MAX_SPEED - BASE_SPEED)) * 0.14));
+    const beyond = Math.max(0, Math.min(1, (speed - MAX_SPEED) / (TOP_SPEED - MAX_SPEED)));
+    const targetZoom = base - beyond * 0.08 - boost * 0.05;
+    this.shake = Math.max(0, this.shake - dt * 3);
 
     if (!this.cameraReady) {
       this.cx = tx;
@@ -163,8 +194,22 @@ export class Renderer {
     }
   }
 
-  spawnRipple(x: number, y: number): void {
-    this.ripples.push({ x, y, age: 0 });
+  spawnRipple(x: number, y: number, big = false): void {
+    this.ripples.push({ x, y, age: 0, big });
+    if (big) this.ripples.push({ x, y, age: -0.12, big: false });
+  }
+
+  popup(x: number, y: number, text: string, accent = false, size = 13): void {
+    this.popups.push({ x, y, text, age: 0, accent, size });
+  }
+
+  kick(amount: number): void {
+    this.shake = Math.min(1, this.shake + amount);
+  }
+
+  /** Clears transient effects (new run). */
+  clearEffects(): void {
+    this.popups.length = 0;
   }
 
   updateEffects(dt: number, time: number): void {
@@ -189,11 +234,15 @@ export class Renderer {
       this.ripples[i].age += dt;
       if (this.ripples[i].age > RIPPLE_LIFE) this.ripples.splice(i, 1);
     }
+    for (let i = this.popups.length - 1; i >= 0; i--) {
+      this.popups[i].age += dt;
+      if (this.popups[i].age > POPUP_LIFE) this.popups.splice(i, 1);
+    }
   }
 
   // ───────────────────────── frame ─────────────────────────
 
-  render(car: Car, track: Track, ghost: GhostPose | null, glow: number): void {
+  render(car: Car, track: Track, ghost: GhostPose | null, glow: number, fx: FrameFx): void {
     const { ctx, dpr, vw, vh } = this;
     const pal = this.theme.palette;
     const s = this.scale;
@@ -204,8 +253,9 @@ export class Renderer {
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     // World transform: camera centre sits slightly below screen centre.
-    const ox = vw * 0.5 - this.cx * s;
-    const oy = vh * 0.55 - this.cy * s;
+    const sh = this.shake * this.shake * 5;
+    const ox = vw * 0.5 - this.cx * s + (sh ? (Math.random() - 0.5) * sh : 0);
+    const oy = vh * 0.55 - this.cy * s + (sh ? (Math.random() - 0.5) * sh : 0);
     ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
 
     const pad = 120;
@@ -216,13 +266,18 @@ export class Renderer {
       b: (vh - oy) / s + pad,
     };
 
+    this.drawProps(track, pal, view);
     this.drawRoad(track, pal, view);
+    this.drawPads(track, pal, view, fx.time);
     this.drawTrails(pal);
     this.drawDust(pal);
     this.drawApexes(track, pal, view);
+    this.drawOrbs(track, pal, view, fx.time);
     this.drawRipples(pal);
+    this.drawStreaks(car, pal, view, fx.boost);
     if (ghost && ghost.alpha > 0.002) this.drawGhost(ghost, pal);
     this.drawCar(car, pal, glow);
+    this.drawPopups(pal, ox, oy);
 
     // Grain, anchored to the world so it reads as asphalt/paper texture.
     if (this.grain) {
@@ -235,7 +290,153 @@ export class Renderer {
     }
   }
 
-  private drawRoad(track: Track, pal: Palette, v: { l: number; r: number; t: number; b: number }): void {
+  private drawProps(track: Track, pal: Palette, v: View): void {
+    const { ctx } = this;
+    const shade = css(pal.propShade);
+    const fill = css(pal.prop);
+    const alt = css(pal.propAlt);
+    for (const p of track.props) {
+      if (p.x < v.l - 40 || p.x > v.r + 40 || p.y < v.t - 40 || p.y > v.b + 40) continue;
+      const r = p.r;
+      if (p.kind === 2) {
+        // Bush: small cluster.
+        ctx.fillStyle = shade;
+        ctx.beginPath();
+        ctx.arc(p.x + 2, p.y + 3, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = fill;
+        for (let i = 0; i < 3; i++) {
+          const a = p.seed * 6.28 + i * 2.1;
+          ctx.beginPath();
+          ctx.arc(p.x + Math.cos(a) * r * 0.45, p.y + Math.sin(a) * r * 0.45, r * 0.62, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        continue;
+      }
+      ctx.fillStyle = shade;
+      ctx.beginPath();
+      ctx.arc(p.x + r * 0.28, p.y + r * 0.42, r * 1.02, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = p.kind === 0 ? fill : alt;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      if (p.kind === 0) {
+        ctx.fillStyle = alt;
+        ctx.beginPath();
+        ctx.arc(p.x - r * 0.22, p.y - r * 0.24, r * 0.56, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  private drawPads(track: Track, pal: Palette, v: View, time: number): void {
+    const { ctx } = this;
+    for (const pad of track.pads) {
+      if (pad.x < v.l || pad.x > v.r || pad.y < v.t || pad.y > v.b) continue;
+      ctx.save();
+      ctx.translate(pad.x, pad.y);
+      ctx.rotate(pad.angle + Math.PI / 2);
+      const dim = pad.used ? 0.3 : 1;
+      ctx.fillStyle = css(pal.accent, 0.09 * dim);
+      ctx.beginPath();
+      ctx.roundRect(-20, -34, 40, 68, 10);
+      ctx.fill();
+      ctx.strokeStyle = css(pal.accent);
+      ctx.lineWidth = 3.2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let i = 0; i < 3; i++) {
+        const y = 16 - i * 16;
+        const wave = Math.max(0, Math.sin(time * 9 - i * 1.3));
+        ctx.globalAlpha = (0.28 + 0.72 * wave) * dim;
+        ctx.beginPath();
+        ctx.moveTo(-11, y + 7);
+        ctx.lineTo(0, y - 4);
+        ctx.lineTo(11, y + 7);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  private drawOrbs(track: Track, pal: Palette, v: View, time: number): void {
+    const { ctx } = this;
+    for (const o of track.orbs) {
+      if (o.x < v.l || o.x > v.r || o.y < v.t || o.y > v.b) continue;
+      if (o.taken) {
+        if (o.age < 0 || o.age > 0.45) continue;
+        const t = o.age / 0.45;
+        ctx.strokeStyle = css(pal.accent, 0.7 * (1 - t));
+        ctx.lineWidth = 1.6 * (1 - t) + 0.4;
+        ctx.beginPath();
+        ctx.arc(o.x, o.y, 4 + t * 18, 0, Math.PI * 2);
+        ctx.stroke();
+        continue;
+      }
+      const pulse = 0.5 + 0.5 * Math.sin(time * 4 - o.idx * 0.7);
+      const halo = ctx.createRadialGradient(o.x, o.y, 0, o.x, o.y, 13);
+      halo.addColorStop(0, css(pal.accent, 0.28 + 0.12 * pulse));
+      halo.addColorStop(1, css(pal.accent, 0));
+      ctx.fillStyle = halo;
+      ctx.fillRect(o.x - 13, o.y - 13, 26, 26);
+      ctx.fillStyle = css(pal.orb);
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, 3.2 + pulse * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private drawStreaks(car: Car, pal: Palette, v: View, boost: number): void {
+    const speed = car.speed;
+    const intensity = Math.min(1, Math.max(0, (speed - 400) / 200) + boost);
+    if (intensity <= 0.01) return;
+    const { ctx } = this;
+    const w = v.r - v.l;
+    const h = v.b - v.t;
+    while (this.streaks.length < STREAK_COUNT) {
+      this.streaks.push({ x: v.l + Math.random() * w, y: v.t + Math.random() * h });
+    }
+    ctx.strokeStyle = css(pal.edge);
+    ctx.lineWidth = 1.1;
+    ctx.lineCap = 'round';
+    const k = 0.07 + boost * 0.05;
+    for (const st of this.streaks) {
+      if (st.x < v.l || st.x > v.r || st.y < v.t || st.y > v.b) {
+        // Respawn ahead of the car so lines stream past.
+        st.x = car.x + car.vx * (0.6 + Math.random() * 0.9) + (Math.random() - 0.5) * w;
+        st.y = car.y + car.vy * (0.6 + Math.random() * 0.9) + (Math.random() - 0.5) * h * 0.6;
+      }
+      ctx.globalAlpha = 0.11 * intensity;
+      ctx.beginPath();
+      ctx.moveTo(st.x, st.y);
+      ctx.lineTo(st.x - car.vx * k, st.y - car.vy * k);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  private drawPopups(pal: Palette, ox: number, oy: number): void {
+    if (!this.popups.length) return;
+    const { ctx, dpr } = this;
+    const s = this.scale;
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const p of this.popups) {
+      const t = p.age / POPUP_LIFE;
+      const rise = (1 - Math.pow(1 - t, 3)) * 34;
+      const pop = t < 0.12 ? 0.8 + (t / 0.12) * 0.25 : 1.05 - Math.min(0.05, (t - 0.12) * 0.2);
+      ctx.globalAlpha = t < 0.7 ? 1 : 1 - (t - 0.7) / 0.3;
+      ctx.font = `600 ${(p.size * pop).toFixed(1)}px -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif`;
+      ctx.fillStyle = p.accent ? css(pal.accent) : css(pal.edge, 0.9);
+      ctx.fillText(p.text, p.x * s + ox, p.y * s + oy - rise);
+    }
+    ctx.restore();
+  }
+
+  private drawRoad(track: Track, pal: Palette, v: View): void {
     const { ctx } = this;
     const nodes = track.nodes;
     const hw = track.halfWidth;
@@ -303,6 +504,19 @@ export class Renderer {
     ctx.beginPath();
     spline(ctx, rx, ry, true, false);
     ctx.stroke();
+
+    // Reflector posts every 140px — strong, cheap sense of speed.
+    ctx.fillStyle = css(pal.edge, 0.4);
+    const off = hw + 10;
+    for (let i = a; i <= b; i++) {
+      const n = nodes[i];
+      if (Math.round(n.s / NODE_SPACING) % 10 !== 0) continue;
+      ctx.beginPath();
+      ctx.arc(n.x - n.nx * off, n.y - n.ny * off, 1.7, 0, Math.PI * 2);
+      ctx.moveTo(n.x + n.nx * off + 1.7, n.y + n.ny * off);
+      ctx.arc(n.x + n.nx * off, n.y + n.ny * off, 1.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   private drawTrails(pal: Palette): void {
@@ -344,7 +558,7 @@ export class Renderer {
     ctx.restore();
   }
 
-  private drawApexes(track: Track, pal: Palette, v: { l: number; r: number; t: number; b: number }): void {
+  private drawApexes(track: Track, pal: Palette, v: View): void {
     const { ctx } = this;
     for (const ap of track.apexes) {
       if (ap.mx < v.l || ap.mx > v.r || ap.my < v.t || ap.my > v.b) continue;
@@ -380,12 +594,13 @@ export class Renderer {
   private drawRipples(pal: Palette): void {
     const { ctx } = this;
     for (const r of this.ripples) {
+      if (r.age < 0) continue;
       const t = r.age / RIPPLE_LIFE;
       const e = 1 - Math.pow(1 - t, 3);
       ctx.strokeStyle = css(pal.accent, 0.55 * (1 - t));
       ctx.lineWidth = 0.6 + 2.2 * (1 - t);
       ctx.beginPath();
-      ctx.arc(r.x, r.y, 6 + 64 * e, 0, Math.PI * 2);
+      ctx.arc(r.x, r.y, 6 + (r.big ? 96 : 64) * e, 0, Math.PI * 2);
       ctx.stroke();
     }
   }

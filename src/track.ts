@@ -51,6 +51,8 @@ export interface ApexZone {
   passed: boolean;
   /** Seconds since collection (drives the fade); −1 while uncollected. */
   fade: number;
+  /** Closest approach while inside the zone (graded on exit). */
+  best: number;
 }
 
 export interface TrackQuery {
@@ -70,6 +72,46 @@ export interface TrackPose {
   nx: number;
   ny: number;
 }
+
+export interface Orb {
+  x: number;
+  y: number;
+  s: number;
+  /** Position within its chain (drives the rising arpeggio). */
+  idx: number;
+  taken: boolean;
+  /** Seconds since pickup; −1 while available. */
+  age: number;
+}
+
+export interface BoostPad {
+  x: number;
+  y: number;
+  s: number;
+  /** Travel angle at the pad. */
+  angle: number;
+  lat: number;
+  used: boolean;
+}
+
+export interface Prop {
+  x: number;
+  y: number;
+  s: number;
+  /** 0 = tree, 1 = rock, 2 = bush */
+  kind: number;
+  r: number;
+  seed: number;
+}
+
+interface Pending {
+  s: number;
+  lat: number;
+  kind: 'orb' | 'pad';
+  idx: number;
+}
+
+const SCENERY_LAG_NODES = 150;
 
 type SegmentType = 'sweep' | 'scurve' | 'straight';
 
@@ -95,7 +137,13 @@ function mulberry32(seed: number): () => number {
 export class Track {
   readonly nodes: TrackNode[] = [];
   readonly apexes: ApexZone[] = [];
+  readonly orbs: Orb[] = [];
+  readonly pads: BoostPad[] = [];
+  readonly props: Prop[] = [];
   readonly halfWidth = ROAD_HALF_WIDTH;
+
+  private pending: Pending[] = [];
+  private sceneryS = 0;
 
   private heading = 0;
   private seg: Segment;
@@ -134,6 +182,10 @@ export class Track {
     let apexDrop = 0;
     while (apexDrop < this.apexes.length && this.apexes[apexDrop].s < this.firstS + 70) apexDrop++;
     if (apexDrop > 0) this.apexes.splice(0, apexDrop);
+    const cut = this.firstS + 40;
+    pruneBefore(this.orbs, cut);
+    pruneBefore(this.pads, cut);
+    pruneBefore(this.props, this.firstS - 600);
   }
 
   // ───────────────────────── generation ─────────────────────────
@@ -183,6 +235,12 @@ export class Track {
 
     this.lastType = type;
     this.seg = { type, K: K * sign, L, pos: 0 };
+
+    // Boost pads on straights (and the odd sweep entry).
+    const here = this.lastS;
+    if (here > 1800 && ((type === 'straight' && r() < 0.75) || (type === 'sweep' && r() < 0.18))) {
+      this.pending.push({ s: here + L * (type === 'straight' ? 0.4 : 0.08), lat: (r() - 0.5) * 56, kind: 'pad', idx: 0 });
+    }
   }
 
   private curvatureAtSegment(): number {
@@ -212,6 +270,66 @@ export class Track {
     };
     this.nodes.push(node);
     this.detectApex();
+    this.flushPending();
+    while (this.sceneryS < node.s - SCENERY_LAG_NODES * NODE_SPACING) {
+      this.placeScenery(this.sceneryS);
+      this.sceneryS += NODE_SPACING;
+    }
+  }
+
+  private flushPending(): void {
+    const limit = this.lastS - 2 * NODE_SPACING;
+    for (let i = 0; i < this.pending.length; ) {
+      const p = this.pending[i];
+      if (p.s > limit) {
+        i++;
+        continue;
+      }
+      this.pending.splice(i, 1);
+      const pose = this.poseAt(p.s);
+      if (!pose) continue;
+      const x = pose.x + pose.nx * p.lat;
+      const y = pose.y + pose.ny * p.lat;
+      if (p.kind === 'orb') this.orbs.push({ x, y, s: p.s, idx: p.idx, taken: false, age: -1 });
+      else this.pads.push({ x, y, s: p.s, angle: pose.angle, lat: p.lat, used: false });
+    }
+  }
+
+  /** Sparse off-road scenery, placed well behind the generation front so the
+   *  road can be checked on both sides before anything is planted. */
+  private placeScenery(s: number): void {
+    const r = this.rng;
+    const n = this.nodes;
+    const i = Math.round((s - n[0].s) / NODE_SPACING);
+    if (i < 0 || i >= n.length) return;
+    const node = n[i];
+    for (const side of [-1, 1]) {
+      const roll = r();
+      if (roll > 0.2) continue;
+      const far = roll < 0.13;
+      const kind = far ? (r() < 0.8 ? 0 : 1) : r() < 0.6 ? 2 : 1;
+      const rad = kind === 0 ? 9 + r() * 16 : kind === 1 ? 3 + r() * 6 : 4 + r() * 5;
+      const lat = side * (ROAD_HALF_WIDTH + rad + (far ? 30 + Math.pow(r(), 1.4) * 360 : 14 + r() * 40));
+      const along = (r() - 0.5) * NODE_SPACING;
+      const x = node.x + node.nx * lat - node.ny * along;
+      const y = node.y + node.ny * lat + node.nx * along;
+      if (this.clearance(x, y, i) < ROAD_HALF_WIDTH + rad + 10) continue;
+      this.props.push({ x, y, s, kind, r: rad, seed: r() });
+    }
+  }
+
+  private clearance(x: number, y: number, around: number): number {
+    const n = this.nodes;
+    let best = Infinity;
+    const lo = Math.max(0, around - SCENERY_LAG_NODES);
+    const hi = Math.min(n.length - 1, around + SCENERY_LAG_NODES);
+    for (let j = lo; j <= hi; j += 2) {
+      const dx = n[j].x - x;
+      const dy = n[j].y - y;
+      const d = dx * dx + dy * dy;
+      if (d < best) best = d;
+    }
+    return Math.sqrt(best);
   }
 
   /** Lagged peak detection so the full ±55px arc already exists. */
@@ -246,7 +364,17 @@ export class Track {
       collected: false,
       passed: false,
       fade: -1,
+      best: Infinity,
     });
+
+    // Orb chain tracing the racing line: outside → apex → outside.
+    let idx = 0;
+    for (let d = -230; d <= 90; d += 32) {
+      const u = d / 170;
+      const bell = Math.exp(-u * u * 2.2);
+      const lat = side * (-26 * (1 - bell) + 46 * bell);
+      this.pending.push({ s: node.s + d, lat, kind: 'orb', idx: idx++ });
+    }
   }
 
   // ───────────────────────── queries ─────────────────────────
@@ -332,6 +460,12 @@ export class Track {
     const t = Math.max(0, Math.min(1, f - i));
     return n[i].k + (n[i + 1].k - n[i].k) * t;
   }
+}
+
+function pruneBefore<T extends { s: number }>(arr: T[], s: number): void {
+  let k = 0;
+  while (k < arr.length && arr[k].s < s) k++;
+  if (k > 0) arr.splice(0, k);
 }
 
 /** Shortest distance from a point to a flat [x, y, …] polyline. */
