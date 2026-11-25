@@ -381,6 +381,23 @@
         opacity: 0;
         transition: opacity 300ms var(--ease);
       }
+      #powers {
+        display: flex;
+        gap: 6px;
+        margin-top: 8px;
+        flex-wrap: wrap;
+        max-width: 50vw;
+      }
+      #powers span {
+        padding: 3px 7px;
+        border-radius: 6px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        font-variant-numeric: tabular-nums;
+        background: var(--accent);
+        color: #fff;
+      }
       #mult.show {
         opacity: 1;
       }
@@ -870,7 +887,7 @@
     <div id="drift" class="center-note"></div>
     <div id="banner" class="center-note"></div>
     <div id="hint" class="center-note">
-      Hold left / right to shift your line<br />Hold into a bend to drift · drifts charge nitro
+      Hold left / right to shift your line · hold into a bend to drift<br />Weave through traffic · nitro smashes cars out of the way
     </div>
     <div id="results" aria-live="polite"></div>
 
@@ -878,6 +895,7 @@
       <div class="readout">
         <div id="score">0</div>
         <div id="mult">2x FLOW</div>
+        <div id="powers"></div>
       </div>
       <div id="timer">
         <div id="time">30</div>

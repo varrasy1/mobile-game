@@ -94,20 +94,89 @@ export interface BoostPad {
   used: boolean;
 }
 
+export type PropKind = 'tree' | 'rock' | 'bush' | 'pine' | 'snowpine' | 'cactus' | 'building' | 'lamp' | 'ember' | 'palm';
+
 export interface Prop {
   x: number;
   y: number;
   s: number;
-  /** 0 = tree, 1 = rock, 2 = bush */
-  kind: number;
+  kind: PropKind;
   r: number;
   seed: number;
+  /** Lamps: world angle pointing toward the road. */
+  angle: number;
+}
+
+/** 0 magnet · 1 shield · 2 +time · 3 double points */
+export type PowerKind = 0 | 1 | 2 | 3;
+
+export interface PowerUp {
+  x: number;
+  y: number;
+  s: number;
+  lat: number;
+  kind: PowerKind;
+  taken: boolean;
+  age: number;
+}
+
+/** Distance between checkpoints / world zones. */
+export const ZONE_LENGTH = 15000;
+const ZONE_COUNT = 6;
+
+type Weighted = [PropKind, number][];
+interface ZoneScenery {
+  far: Weighted;
+  near: Weighted;
+  density: number;
+  lamps: boolean;
+}
+const ZONES: ZoneScenery[] = [
+  { far: [['tree', 4], ['palm', 3], ['rock', 1]], near: [['bush', 3], ['rock', 2]], density: 1, lamps: false },
+  { far: [['cactus', 4], ['rock', 3]], near: [['cactus', 2], ['rock', 3], ['bush', 1]], density: 0.85, lamps: false },
+  { far: [['pine', 7], ['tree', 1]], near: [['bush', 2], ['rock', 1], ['pine', 1]], density: 1.35, lamps: false },
+  { far: [['building', 1]], near: [['bush', 1]], density: 0.9, lamps: true },
+  { far: [['snowpine', 6], ['rock', 1]], near: [['rock', 2], ['snowpine', 1]], density: 1.1, lamps: false },
+  { far: [['ember', 3], ['rock', 3]], near: [['rock', 3], ['ember', 1]], density: 1, lamps: false },
+];
+
+function pick(list: Weighted, r: number): PropKind {
+  let total = 0;
+  for (const [, w] of list) total += w;
+  let x = r * total;
+  for (const [k, w] of list) {
+    x -= w;
+    if (x <= 0) return k;
+  }
+  return list[0][0];
+}
+
+function propSize(kind: PropKind, r: number): number {
+  switch (kind) {
+    case 'tree':
+      return 9 + r * 16;
+    case 'pine':
+    case 'snowpine':
+      return 10 + r * 14;
+    case 'palm':
+      return 12 + r * 8;
+    case 'cactus':
+      return 6 + r * 6;
+    case 'building':
+      return 18 + r * 22;
+    case 'ember':
+      return 5 + r * 7;
+    case 'bush':
+      return 4 + r * 5;
+    default:
+      return 3 + r * 6;
+  }
 }
 
 interface Pending {
   s: number;
   lat: number;
-  kind: 'orb' | 'pad';
+  kind: 'orb' | 'pad' | 'power';
   idx: number;
 }
 
@@ -140,6 +209,9 @@ export class Track {
   readonly orbs: Orb[] = [];
   readonly pads: BoostPad[] = [];
   readonly props: Prop[] = [];
+  readonly powerups: PowerUp[] = [];
+  private zoneOrigin = 0;
+  private nextPowerS = 2400;
   readonly halfWidth = ROAD_HALF_WIDTH;
 
   private pending: Pending[] = [];
@@ -185,6 +257,7 @@ export class Track {
     const cut = this.firstS + 40;
     pruneBefore(this.orbs, cut);
     pruneBefore(this.pads, cut);
+    pruneBefore(this.powerups, cut);
     pruneBefore(this.props, this.firstS - 600);
   }
 
@@ -270,6 +343,12 @@ export class Track {
     };
     this.nodes.push(node);
     this.detectApex();
+    if (node.s > this.nextPowerS) {
+      const r = this.rng;
+      const lanes = [-36, 0, 36];
+      this.pending.push({ s: node.s + 40, lat: lanes[Math.floor(r() * 3)], kind: 'power', idx: Math.floor(r() * 4) });
+      this.nextPowerS = node.s + 2200 + r() * 1400;
+    }
     this.flushPending();
     while (this.sceneryS < node.s - SCENERY_LAG_NODES * NODE_SPACING) {
       this.placeScenery(this.sceneryS);
@@ -291,30 +370,69 @@ export class Track {
       const x = pose.x + pose.nx * p.lat;
       const y = pose.y + pose.ny * p.lat;
       if (p.kind === 'orb') this.orbs.push({ x, y, s: p.s, idx: p.idx, taken: false, age: -1 });
-      else this.pads.push({ x, y, s: p.s, angle: pose.angle, lat: p.lat, used: false });
+      else if (p.kind === 'pad') this.pads.push({ x, y, s: p.s, angle: pose.angle, lat: p.lat, used: false });
+      else this.powerups.push({ x, y, s: p.s, lat: p.lat, kind: p.idx as PowerKind, taken: false, age: -1 });
     }
   }
 
   /** Sparse off-road scenery, placed well behind the generation front so the
    *  road can be checked on both sides before anything is planted. */
+  /** World zone (0…5) for an arc length; zones are aligned to the current run's start. */
+  zoneAt(s: number): number {
+    const z = s < this.zoneOrigin ? 0 : Math.floor((s - this.zoneOrigin) / ZONE_LENGTH);
+    return ((z % ZONE_COUNT) + ZONE_COUNT) % ZONE_COUNT;
+  }
+
+  /** Re-aligns zones to a new run start and replants scenery ahead of `from`. */
+  setZoneOrigin(origin: number, from: number): void {
+    this.zoneOrigin = origin;
+    const keep = this.props.filter((p) => p.s < from);
+    this.props.length = 0;
+    this.props.push(...keep);
+    this.sceneryS = Math.min(this.sceneryS, from);
+    const front = this.lastS - SCENERY_LAG_NODES * NODE_SPACING;
+    while (this.sceneryS < front) {
+      this.placeScenery(this.sceneryS);
+      this.sceneryS += NODE_SPACING;
+    }
+  }
+
   private placeScenery(s: number): void {
     const r = this.rng;
     const n = this.nodes;
     const i = Math.round((s - n[0].s) / NODE_SPACING);
     if (i < 0 || i >= n.length) return;
     const node = n[i];
+    const zone = ZONES[this.zoneAt(s)];
+
+    // Street lamps: regular rhythm, alternating sides.
+    if (zone.lamps && Math.round(s / NODE_SPACING) % 12 === 0) {
+      const side = Math.round(s / NODE_SPACING) % 24 === 0 ? 1 : -1;
+      const lat = side * (ROAD_HALF_WIDTH + 16);
+      this.props.push({
+        x: node.x + node.nx * lat,
+        y: node.y + node.ny * lat,
+        s,
+        kind: 'lamp',
+        r: 6,
+        seed: r(),
+        angle: Math.atan2(-node.ny * side, -node.nx * side),
+      });
+    }
+
     for (const side of [-1, 1]) {
       const roll = r();
-      if (roll > 0.2) continue;
-      const far = roll < 0.13;
-      const kind = far ? (r() < 0.8 ? 0 : 1) : r() < 0.6 ? 2 : 1;
-      const rad = kind === 0 ? 9 + r() * 16 : kind === 1 ? 3 + r() * 6 : 4 + r() * 5;
-      const lat = side * (ROAD_HALF_WIDTH + rad + (far ? 30 + Math.pow(r(), 1.4) * 360 : 14 + r() * 40));
+      if (roll > 0.2 * zone.density) continue;
+      const far = roll < 0.13 * zone.density;
+      const kind = pick(far ? zone.far : zone.near, r());
+      const rad = propSize(kind, r());
+      const gap = kind === 'building' ? 34 + r() * 120 : far ? 30 + Math.pow(r(), 1.4) * 360 : 14 + r() * 40;
+      const lat = side * (ROAD_HALF_WIDTH + rad + gap);
       const along = (r() - 0.5) * NODE_SPACING;
       const x = node.x + node.nx * lat - node.ny * along;
       const y = node.y + node.ny * lat + node.nx * along;
-      if (this.clearance(x, y, i) < ROAD_HALF_WIDTH + rad + 10) continue;
-      this.props.push({ x, y, s, kind, r: rad, seed: r() });
+      if (this.clearance(x, y, i) < ROAD_HALF_WIDTH + rad * (kind === 'building' ? 1.5 : 1) + 10) continue;
+      this.props.push({ x, y, s, kind, r: rad, seed: r(), angle: 0 });
     }
   }
 

@@ -20,6 +20,11 @@ export class AudioEngine {
   private droneFilter: BiquadFilterNode | null = null;
   private noiseGain: GainNode | null = null;
   private send: GainNode | null = null;
+  private engineA: OscillatorNode | null = null;
+  private engineB: OscillatorNode | null = null;
+  private engineFilter: BiquadFilterNode | null = null;
+  private engineGain: GainNode | null = null;
+  private noiseBuf: AudioBuffer | null = null;
   private muted: boolean;
 
   constructor(muted: boolean) {
@@ -108,6 +113,39 @@ export class AudioEngine {
     noise.connect(band).connect(ng).connect(master);
     noise.start();
     this.noiseGain = ng;
+    this.noiseBuf = noise.buffer;
+
+    // ── Engine: two detuned saws through a soft clipper and a lowpass ──
+    const eA = ctx.createOscillator();
+    const eB = ctx.createOscillator();
+    eA.type = 'sawtooth';
+    eB.type = 'sawtooth';
+    eA.frequency.value = 60;
+    eB.frequency.value = 120.5;
+    const eBGain = ctx.createGain();
+    eBGain.gain.value = 0.45;
+    const shaper = ctx.createWaveShaper();
+    const curve = new Float32Array(256);
+    for (let i = 0; i < 256; i++) {
+      const x = (i / 255) * 2 - 1;
+      curve[i] = Math.tanh(x * 2.2);
+    }
+    shaper.curve = curve;
+    const ef = ctx.createBiquadFilter();
+    ef.type = 'lowpass';
+    ef.frequency.value = 500;
+    ef.Q.value = 2.5;
+    const eg = ctx.createGain();
+    eg.gain.value = 0;
+    eA.connect(shaper);
+    eB.connect(eBGain).connect(shaper);
+    shaper.connect(ef).connect(eg).connect(master);
+    eA.start();
+    eB.start();
+    this.engineA = eA;
+    this.engineB = eB;
+    this.engineFilter = ef;
+    this.engineGain = eg;
 
     // ── Stereo ping-pong delay for chimes ──
     const send = ctx.createGain();
@@ -159,6 +197,80 @@ export class AudioEngine {
   }
 
   /** speedNorm 0…1, slip = |lateral velocity| px/s. */
+  /** Engine voice: speed in px/s, gears give the arcade "shift" feel. */
+  engine(speed: number, active: boolean, nitro: boolean): void {
+    if (!this.ctx || !this.engineA || !this.engineB || !this.engineFilter || !this.engineGain) return;
+    const now = this.ctx.currentTime;
+    const gears = [0, 240, 320, 400, 480, 1000];
+    let g = 1;
+    while (g < gears.length - 1 && speed > gears[g]) g++;
+    const lo = gears[g - 1];
+    const hi = gears[g];
+    const rpm = Math.max(0, Math.min(1, (speed - lo) / (hi - lo)));
+    const f = (48 + g * 6 + rpm * 70) * (nitro ? 1.12 : 1);
+    this.engineA.frequency.setTargetAtTime(f, now, 0.05);
+    this.engineB.frequency.setTargetAtTime(f * 2.01, now, 0.05);
+    this.engineFilter.frequency.setTargetAtTime(380 + rpm * 900 + (nitro ? 600 : 0), now, 0.06);
+    this.engineGain.gain.setTargetAtTime(active ? 0.03 + rpm * 0.02 + (nitro ? 0.02 : 0) : 0.012, now, 0.1);
+  }
+
+  private burst(dur: number, from: number, to: number, q: number, level: number): void {
+    if (!this.ctx || !this.master || !this.noiseBuf) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime + 0.002;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = q;
+    bp.frequency.setValueAtTime(from, t);
+    bp.frequency.exponentialRampToValueAtTime(to, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(level, t + Math.min(0.03, dur * 0.2));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp).connect(g).connect(this.master);
+    src.start(t, Math.random() * 1.2);
+    src.stop(t + dur + 0.05);
+  }
+
+  private thump(freq: number, dur: number, level: number): void {
+    if (!this.ctx || !this.master) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime + 0.002;
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(freq, t);
+    o.frequency.exponentialRampToValueAtTime(freq * 0.4, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(level, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + dur + 0.05);
+  }
+
+  crash(): void {
+    this.burst(0.5, 1800, 300, 0.8, 0.5);
+    this.thump(90, 0.35, 0.4);
+  }
+
+  /** Doppler-ish whoosh for a close pass. */
+  nearMiss(): void {
+    this.burst(0.32, 2600, 500, 3, 0.28);
+  }
+
+  takedown(): void {
+    this.burst(0.6, 2200, 250, 0.7, 0.45);
+    this.thump(70, 0.45, 0.45);
+    setTimeout(() => this.chime(7), 60);
+  }
+
+  pickup(): void {
+    [4, 6, 9].forEach((st, i) => setTimeout(() => this.blip(st, 0.07), i * 55));
+  }
+
   update(speedNorm: number, slip: number, onRoad: boolean): void {
     if (!this.ctx || !this.droneFilter || !this.noiseGain) return;
     const now = this.ctx.currentTime;

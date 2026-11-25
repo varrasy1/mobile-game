@@ -94,6 +94,33 @@ function mixRGBA(a: RGBA, b: RGBA, t: number): RGBA {
  * over 400ms. The DOM side (body background, HUD colour) uses a matching CSS
  * transition driven by the `data-theme` attribute.
  */
+/** World zones — each checkpoint drives into the next one. */
+export interface Biome {
+  name: string;
+  /** 0…1 darkness (lights, headlights). Light theme uses a softened value. */
+  night: number;
+  dark: Pick<Palette, 'bg' | 'road' | 'prop' | 'propAlt'>;
+  light: Pick<Palette, 'bg' | 'road' | 'prop' | 'propAlt'>;
+}
+
+const biome = (name: string, night: number, d: string[], l: string[]): Biome => ({
+  name,
+  night,
+  dark: { bg: hex(d[0]), road: hex(d[1]), prop: hex(d[2]), propAlt: hex(d[3]) },
+  light: { bg: hex(l[0]), road: hex(l[1]), prop: hex(l[2]), propAlt: hex(l[3]) },
+});
+
+export const BIOMES: Biome[] = [
+  biome('COAST', 0, ['#111317', '#1C2026', '#1A1E24', '#22262D'], ['#ECE8E0', '#FAF8F4', '#DDD7CB', '#D2CBBE']),
+  biome('DESERT DUSK', 0.25, ['#1D1411', '#2A211E', '#2E3B2A', '#3B2C23'], ['#EEDCC4', '#FAF2E7', '#B8C39A', '#D9C2A1']),
+  biome('PINE FOREST', 0.4, ['#0D1511', '#19211D', '#16271D', '#1F3527'], ['#E1E8DD', '#F7F9F4', '#B5C8B0', '#A2BA9C']),
+  biome('NEON CITY', 0.9, ['#090B13', '#131624', '#151A2B', '#1E2438'], ['#E3E2E9', '#F7F7FA', '#CCCCD8', '#BDBECD']),
+  biome('SNOWFIELD', 0.12, ['#151B22', '#1E252D', '#1C2A31', '#2A3A43'], ['#EEF2F5', '#FCFDFE', '#C4D2D8', '#B2C5CC']),
+  biome('VOLCANO', 0.65, ['#130C0C', '#201818', '#251A19', '#30221F'], ['#E7DAD4', '#F8F2EF', '#CDBCB5', '#BEADA5']),
+];
+
+const BIOME_KEYS = ['bg', 'road', 'prop', 'propAlt'] as const;
+
 export class Theme {
   name: ThemeName;
   palette: Palette;
@@ -102,11 +129,17 @@ export class Theme {
   private moodFrom = 0;
   private moodTo = 0;
   private moodT = 1;
+  private biomeFrom = 0;
+  private biomeTo = 0;
+  private biomeT = 1;
+  /** Resolved darkness for the current biome blend and theme. */
+  night = 0;
 
   constructor(name: ThemeName) {
     this.name = name;
     this.progress = name === 'light' ? 1 : 0;
     this.palette = { ...PALETTES[name] };
+    this.resolve(this.progress);
     this.applyDom();
   }
 
@@ -125,12 +158,27 @@ export class Theme {
     this.moodT = 0;
   }
 
+  /** Starts a smooth blend into another world zone. */
+  setBiome(index: number): void {
+    const next = ((index % BIOMES.length) + BIOMES.length) % BIOMES.length;
+    if (next === this.biomeTo) return;
+    this.biomeFrom = this.biomeTo;
+    this.biomeTo = next;
+    this.biomeT = 0;
+  }
+
+  get biomeIndex(): number {
+    return this.biomeTo;
+  }
+
   /** Advances the blends; returns true while a transition is running. */
   update(dt: number): boolean {
     const target = this.name === 'light' ? 1 : 0;
     const themeMoving = this.progress !== target;
     const moodMoving = this.moodT < 1;
-    if (!themeMoving && !moodMoving) return false;
+    const biomeMoving = this.biomeT < 1;
+    if (!themeMoving && !moodMoving && !biomeMoving) return false;
+    if (biomeMoving) this.biomeT = Math.min(1, this.biomeT + dt / 2.2);
     if (themeMoving) {
       const step = dt / TRANSITION_S;
       this.progress =
@@ -155,6 +203,16 @@ export class Theme {
         ca[3] + (cb[3] - ca[3]) * t,
       ];
     }
+    const bt = smooth(this.biomeT);
+    const bf = BIOMES[this.biomeFrom];
+    const bto = BIOMES[this.biomeTo];
+    for (const k of BIOME_KEYS) {
+      const d = mixRGBA(bf.dark[k], bto.dark[k], bt);
+      const l = mixRGBA(bf.light[k], bto.light[k], bt);
+      out[k] = mixRGBA(d, l, t);
+    }
+    const n = bf.night + (bto.night - bf.night) * bt;
+    this.night = n * (1 - 0.75 * t);
     const mt = smooth(this.moodT);
     const dark = mixRGBA(MOODS.dark[this.moodFrom], MOODS.dark[this.moodTo], mt);
     const light = mixRGBA(MOODS.light[this.moodFrom], MOODS.light[this.moodTo], mt);

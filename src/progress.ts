@@ -17,6 +17,8 @@ export interface RunStats {
   topKmh: number;
   streak: number; // best apex streak
   coins: number; // coins collected during the run
+  nearMisses: number;
+  takedowns: number;
 }
 
 export const emptyRun = (): RunStats => ({
@@ -30,6 +32,8 @@ export const emptyRun = (): RunStats => ({
   topKmh: 0,
   streak: 0,
   coins: 0,
+  nearMisses: 0,
+  takedowns: 0,
 });
 
 interface Template {
@@ -49,6 +53,8 @@ const TEMPLATES: Template[] = [
   { stat: 'topKmh', goals: [220, 260, 300, 340], text: (n) => `Top ${n} km/h` },
   { stat: 'streak', goals: [4, 7, 10, 15, 20], text: (n) => `Reach ${n}x flow` },
   { stat: 'coins', goals: [40, 90, 160, 260], text: (n) => `Collect ${n} coins in a run` },
+  { stat: 'nearMisses', goals: [3, 8, 15, 25, 40], text: (n) => `${n} close calls in traffic` },
+  { stat: 'takedowns', goals: [1, 3, 6, 10, 15], text: (n) => `${n} nitro takedown${n > 1 ? 's' : ''}` },
 ];
 
 export interface Mission {

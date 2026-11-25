@@ -2,6 +2,7 @@ import { AudioEngine } from './audio';
 import { BASE_SPEED, Car, InputController, TOP_SPEED, autopilotSteer, followSteer } from './car';
 import { CARS, carById, drawCar as drawCarModel, type CarModel } from './cars';
 import { Progress, emptyRun, type Mission, type RunStats } from './progress';
+import { TRAFFIC_PAINTS, TRAFFIC_STYLES } from './props';
 import { Renderer, type GhostPose } from './renderer';
 import {
   GHOST_INTERVAL,
@@ -13,8 +14,9 @@ import {
   savePrefs,
   type GhostRun,
 } from './storage';
-import { Theme } from './theme';
-import { Track, distToPolyline, type TrackQuery } from './track';
+import { BIOMES, Theme } from './theme';
+import { Track, ZONE_LENGTH, distToPolyline, type TrackQuery } from './track';
+import { Traffic, type TrafficCar } from './traffic';
 
 /**
  * TITLE → PLAYING → ENDING (time ran out, car eases off) → RESULTS → PLAYING …
@@ -24,7 +26,7 @@ type GameState = 'TITLE' | 'PLAYING' | 'ENDING' | 'RESULTS';
 
 // ───────────────────────── tuning ─────────────────────────
 
-const SECTOR_LENGTH = 15000; // px → 1.5 km between checkpoints
+const SECTOR_LENGTH = ZONE_LENGTH; // px → 1.5 km between checkpoints / world zones
 const LANE_OVERHANG = 26;
 const START_TIME = 30;
 const MAX_TIME = 60;
@@ -44,6 +46,10 @@ const NITRO_MIN = 0.25;
 const DRIFT_TIERS = [0.5, 1.1, 1.8]; // seconds → GOOD / GREAT / INSANE
 const DRIFT_NAMES = ['', 'GOOD DRIFT', 'GREAT DRIFT', 'INSANE DRIFT'];
 const KMH = 0.6;
+const T_NEAR = 0.6;
+const T_CRASH = 3;
+const T_POWER = 5;
+const POWER_NAMES = ['MAGNET', 'SHIELD', '+5 SEC', '2× POINTS'];
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -75,6 +81,7 @@ const metaCoins = $('meta-coins');
 const missionsEl = $('missions');
 const garageEl = $('garage');
 const garageCanvas = $<HTMLCanvasElement>('garage-canvas');
+const powersEl = $('powers');
 
 // ───────────────────────── setup ─────────────────────────
 
@@ -85,6 +92,7 @@ const progress = new Progress();
 const track = new Track((Math.random() * 2 ** 32) >>> 0);
 const car = new Car();
 const renderer = new Renderer(canvas, theme);
+const traffic = new Traffic({ styles: TRAFFIC_STYLES, paints: TRAFFIC_PAINTS });
 
 let model: CarModel = carById(progress.selected);
 let speedBonus = 0;
@@ -137,6 +145,17 @@ let driftAngle = 0;
 let nitro = 0; // charge 0…1
 let nitroT = 0; // seconds of burn left
 let nitroDur = 1;
+
+// Traffic, power-ups, juice
+let magnetT = 0;
+let shieldT = 0;
+let doubleT = 0;
+let invulnT = 0;
+let nearCombo = 0;
+let nearComboT = 0;
+let slowT = 0;
+let timeScale = 1;
+let shownPowers = '';
 
 // Personal best + ghost
 let bestScore = loadBest();
@@ -411,7 +430,11 @@ function startRun(): void {
   sampleClock = 0;
   shown = { score: -1, mult: -1, time: -1, speed: -1, drift: '', nitro: -1 };
   lane = q.lateral;
-  theme.setMood(0);
+  magnetT = shieldT = doubleT = invulnT = 0;
+  nearCombo = 0;
+  track.setZoneOrigin(q.s, q.s + 160);
+  for (const u of track.powerups) if (u.s < q.s + 160) u.taken = true;
+  traffic.start(q.s);
   for (const ap of track.apexes) if (ap.s < q.s + 30) ap.passed = true;
   for (const o of track.orbs) if (o.s < q.s + 30) o.taken = true;
   input.consumeActive();
@@ -433,6 +456,7 @@ function startRun(): void {
 
 function endRun(): void {
   setState('ENDING');
+  traffic.stop();
   endDrift(false);
   nitroT = 0;
   streak = 0;
@@ -448,6 +472,8 @@ function endRun(): void {
 
 function showResults(): void {
   setState('RESULTS');
+  traffic.stop();
+  traffic.cars.length = 0;
   run.score = score;
   const levelBefore = progress.level;
   const missionsThisRun = progress.missions.map((m) => ({ ...m }));
@@ -536,7 +562,7 @@ function breakStreak(): void {
 }
 
 function addScore(pts: number): void {
-  bonus += pts * (nitroT > 0 ? 2 : 1);
+  bonus += pts * (nitroT > 0 ? 2 : 1) * (doubleT > 0 ? 2 : 1);
 }
 
 function addTime(t: number): void {
@@ -639,9 +665,16 @@ function updateOrbs(dt: number, playing: boolean): void {
       if (o.s < q.s - 20) o.taken = true;
       continue;
     }
-    const dx = o.x - car.x;
-    const dy = o.y - car.y;
-    if (dx * dx + dy * dy < 21 * 21) {
+    let dx = o.x - car.x;
+    let dy = o.y - car.y;
+    if (magnetT > 0 && dx * dx + dy * dy < 170 * 170) {
+      const k = Math.min(1, dt * 9);
+      o.x -= dx * k;
+      o.y -= dy * k;
+      dx = o.x - car.x;
+      dy = o.y - car.y;
+    }
+    if (dx * dx + dy * dy < (magnetT > 0 ? 30 : 21) ** 2) {
       o.taken = true;
       o.age = 0;
       chainCount = o.idx === chainIdx + 1 ? chainCount + 1 : o.idx === 0 ? 1 : 0;
@@ -658,7 +691,7 @@ function updateOrbs(dt: number, playing: boolean): void {
         renderer.popup(car.x, car.y - 30, `CHAIN +${fmt(pts)}  ${COIN}5`, true, 14);
         navigator.vibrate?.(12);
       }
-    } else if (o.s < q.s - 24) {
+    } else if (o.s < q.s - 24 && magnetT <= 0) {
       o.taken = true;
       chainIdx = -1;
       chainCount = 0;
@@ -745,6 +778,118 @@ function updateDrift(dt: number, cmd: number, onRoad: boolean): void {
   if (tier > 0) showDrift(`${DRIFT_NAMES[tier]} ${fmt(driftPts)}`, true);
 }
 
+// ── Traffic: close calls, crashes, nitro takedowns ──
+
+function slowMo(seconds: number): void {
+  slowT = Math.max(slowT, seconds);
+}
+
+function takedown(c: TrafficCar, dl: number, label: string): void {
+  traffic.wreck(c, car.vx, car.vy, dl >= 0 ? 1 : -1);
+  run.takedowns++;
+  const pts = 300 * Math.max(1, streak);
+  addScore(pts);
+  addTime(1);
+  renderer.spawnSparks((c.x + car.x) / 2, (c.y + car.y) / 2, car.vx, car.vy, 26);
+  renderer.kick(0.8);
+  renderer.popup(c.x, c.y - 24, `${label} +${fmt(pts)}`, true, 16);
+  audio.takedown();
+  slowMo(0.22);
+  navigator.vibrate?.([30, 30, 40]);
+}
+
+function crash(c: TrafficCar, dl: number): void {
+  invulnT = 1.3;
+  car.vx *= 0.42;
+  car.vy *= 0.42;
+  driftAngle += (dl >= 0 ? -1 : 1) * 0.9;
+  timeLeft = Math.max(0.5, timeLeft - T_CRASH);
+  breakStreak();
+  endDrift(false);
+  nearCombo = 0;
+  c.v *= 0.75;
+  c.lat += (dl >= 0 ? 1 : -1) * 10;
+  c.brake = 1;
+  lane = q.lateral - (dl >= 0 ? 1 : -1) * 8;
+  renderer.spawnSparks((c.x + car.x) / 2, (c.y + car.y) / 2, car.vx, car.vy, 18);
+  renderer.kick(1);
+  renderer.popup(car.x, car.y - 30, `CRASH −${T_CRASH}s`, true, 15);
+  audio.crash();
+  navigator.vibrate?.(70);
+}
+
+function nearMiss(c: TrafficCar): void {
+  nearCombo = nearComboT > 0 ? nearCombo + 1 : 1;
+  nearComboT = 3;
+  run.nearMisses++;
+  const pts = 150 * nearCombo * Math.max(1, streak);
+  addScore(pts);
+  addTime(T_NEAR);
+  nitro = Math.min(1, nitro + 0.05 * nitroFactor);
+  renderer.popup(c.x, c.y - 22, nearCombo > 1 ? `CLOSE ×${nearCombo} +${fmt(pts)}` : `CLOSE CALL +${fmt(pts)}`, nearCombo > 1, 13);
+  renderer.kick(0.12);
+  audio.nearMiss();
+  navigator.vibrate?.(6);
+}
+
+function updateTrafficPlay(): void {
+  for (const c of traffic.cars) {
+    if (c.wreck || c.resolved) continue;
+    const d = traffic.dims(c);
+    const ds = c.s - q.s;
+    const dl = c.lat - q.lateral;
+    const longR = d.length / 2 + 19;
+    const latR = d.width / 2 + 9;
+    if (Math.abs(ds) < longR) c.minGap = Math.min(c.minGap, Math.abs(dl) - latR);
+    if (Math.abs(ds) < longR - 3 && Math.abs(dl) < latR - 2) {
+      c.resolved = true;
+      if (nitroT > 0) takedown(c, dl, 'TAKEDOWN');
+      else if (shieldT > 0) {
+        shieldT = 0;
+        takedown(c, dl, 'SHIELD SMASH');
+      } else if (invulnT <= 0) crash(c, dl);
+      continue;
+    }
+    if (ds < -longR) {
+      c.resolved = true;
+      if (c.minGap < 16) nearMiss(c);
+    }
+  }
+}
+
+function updatePowerups(): void {
+  for (const u of track.powerups) {
+    if (u.taken) continue;
+    if (u.s > q.s + 60) break;
+    const dx = u.x - car.x;
+    const dy = u.y - car.y;
+    if (dx * dx + dy * dy < 24 * 24) {
+      u.taken = true;
+      u.age = 0;
+      if (u.kind === 0) magnetT = 8;
+      else if (u.kind === 1) shieldT = 15;
+      else if (u.kind === 2) addTime(T_POWER);
+      else doubleT = 8;
+      renderer.popup(u.x, u.y - 20, POWER_NAMES[u.kind], true, 14);
+      renderer.spawnRipple(u.x, u.y);
+      audio.pickup();
+      navigator.vibrate?.(12);
+    }
+  }
+}
+
+function renderPowers(): void {
+  const chips: string[] = [];
+  if (magnetT > 0) chips.push(`MAGNET ${Math.ceil(magnetT)}`);
+  if (shieldT > 0) chips.push('SHIELD');
+  if (doubleT > 0) chips.push(`2× ${Math.ceil(doubleT)}`);
+  const html = chips.map((c) => `<span>${c}</span>`).join('');
+  if (html !== shownPowers) {
+    shownPowers = html;
+    powersEl.innerHTML = html;
+  }
+}
+
 // ───────────────────────── loop ─────────────────────────
 
 let last = performance.now();
@@ -759,6 +904,7 @@ if (import.meta.env.DEV) {
       Car,
       Track,
       progress,
+      traffic,
       get state() {
         return {
           state,
@@ -772,6 +918,8 @@ if (import.meta.env.DEV) {
           drifting,
           driftTier,
           run,
+          shieldT,
+          magnetT,
           samples: recording.length / 3,
         };
       },
@@ -797,8 +945,11 @@ function frame(now: number): void {
 }
 
 function step(now: number): void {
-  const dt = Math.min(Math.max((now - last) / 1000, 0), 0.05);
+  const realDt = Math.min(Math.max((now - last) / 1000, 0), 0.05);
   last = now;
+  slowT = Math.max(0, slowT - realDt);
+  timeScale += ((slowT > 0 ? 0.3 : 1) - timeScale) * Math.min(1, realDt * 14);
+  const dt = realDt * timeScale;
   time += dt;
   stateTime += dt;
   const playing = state === 'PLAYING';
@@ -862,6 +1013,24 @@ function step(now: number): void {
   updateApexes(dt, playing);
   updateOrbs(dt, playing);
   updatePads(playing);
+  traffic.update(dt, track, q.s, sector);
+  if (playing) {
+    updateTrafficPlay();
+    updatePowerups();
+  }
+  magnetT = Math.max(0, magnetT - dt);
+  shieldT = Math.max(0, shieldT - dt);
+  doubleT = Math.max(0, doubleT - dt);
+  invulnT = Math.max(0, invulnT - dt);
+  nearComboT = Math.max(0, nearComboT - dt);
+  for (const u of track.powerups) if (u.taken && u.age >= 0) u.age += dt;
+
+  // World zone follows the road position (title + runs).
+  const zone = track.zoneAt(q.s);
+  if (zone !== theme.biomeIndex) {
+    theme.setBiome(zone);
+    theme.setMood(zone);
+  }
 
   if (playing) {
     runTime += dt;
@@ -877,12 +1046,11 @@ function step(now: number): void {
     if (nextSector > sector) {
       sector = nextSector;
       run.sector = sector + 1;
-      theme.setMood(sector);
       const extra = Math.max(10, 22 - 2 * sector);
       addTime(extra);
       addScore(1000 * sector);
       addCoins(10 * sector);
-      banner('CHECKPOINT', `+${extra}s · SECTOR ${sector + 1}`);
+      banner('CHECKPOINT', `+${extra}s · ${BIOMES[track.zoneAt(q.s + 200)].name}`);
       audio.chord();
       navigator.vibrate?.([12, 50, 12]);
     }
@@ -938,9 +1106,22 @@ function step(now: number): void {
 
   const speedNorm = Math.min(1, Math.max(0, (car.speed - BASE_SPEED * 0.7) / (TOP_SPEED - BASE_SPEED * 0.7)));
   audio.update(speedNorm, visualSlip, onRoad);
+  audio.engine(car.speed, state !== 'TITLE', nitroT > 0);
 
-  renderer.render(car, track, ghostPose(), glow, { boost: boostAmt, time, nitro: nitroAmt, drift: driftAngle });
-  if (state !== 'TITLE') renderHud();
+  renderer.render(car, track, ghostPose(), glow, {
+    boost: boostAmt,
+    time,
+    nitro: nitroAmt,
+    drift: driftAngle,
+    night: theme.night,
+    shield: Math.min(1, shieldT),
+    magnet: magnetT > 0,
+    traffic: traffic.cars,
+  });
+  if (state !== 'TITLE') {
+    renderHud();
+    renderPowers();
+  }
   if (garageOpen) drawGaragePreview();
 }
 

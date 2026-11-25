@@ -1,5 +1,7 @@
 import { BASE_SPEED, MAX_SPEED, TOP_SPEED, type Car } from './car';
 import { CARS, drawCar as drawCarModel, type CarModel } from './cars';
+import { drawHeadlights, drawProp, drawPropLight, drawTraffic, drawTrafficLights, type PropDrawOptions } from './props';
+import type { TrafficCar } from './traffic';
 import { css, type Palette, type Theme } from './theme';
 import { NODE_SPACING, type Track } from './track';
 
@@ -7,6 +9,7 @@ const DPR_CAP = 2.5;
 const TRAIL_LIFE = 1.6;
 const DUST_LIFE = 0.8;
 const SMOKE_LIFE = 1.0;
+const SPARK_LIFE = 0.45;
 const RIPPLE_LIFE = 1.0;
 const MAX_DUST = 140;
 const POPUP_LIFE = 1.1;
@@ -29,6 +32,7 @@ interface TrailPoint {
 
 interface Dust {
   smoke: boolean;
+  spark?: boolean;
   x: number;
   y: number;
   vx: number;
@@ -68,6 +72,14 @@ export interface FrameFx {
   drift: number;
   /** Ghost car model id. */
   ghostModel?: CarModel;
+  /** 0…1 darkness of the current world zone. */
+  night: number;
+  /** 0…1 shield bubble strength. */
+  shield: number;
+  /** Magnet active (pulse ring). */
+  magnet: boolean;
+  /** Traffic to draw. */
+  traffic: readonly TrafficCar[];
 }
 
 type View = { l: number; r: number; t: number; b: number };
@@ -88,6 +100,7 @@ export class Renderer {
   private cameraReady = false;
 
   private grain: CanvasPattern | null = null;
+  private vignette: HTMLCanvasElement | null = null;
   private time = 0;
 
   private trailL: TrailPoint[] = [];
@@ -127,6 +140,22 @@ export class Renderer {
     this.canvas.height = Math.round(this.vh * this.dpr);
     this.canvas.style.width = `${this.vw}px`;
     this.canvas.style.height = `${this.vh}px`;
+    this.vignette = this.makeVignette();
+  }
+
+  /** Soft radial vignette, rendered once per resize at low resolution. */
+  private makeVignette(): HTMLCanvasElement | null {
+    const c = document.createElement('canvas');
+    c.width = 256;
+    c.height = Math.max(64, Math.round((256 * this.vh) / Math.max(1, this.vw)));
+    const g = c.getContext('2d');
+    if (!g) return null;
+    const grad = g.createRadialGradient(c.width / 2, c.height * 0.52, c.height * 0.22, c.width / 2, c.height * 0.52, c.height * 0.75);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, 'rgba(0,0,0,1)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, c.width, c.height);
+    return c;
   }
 
   /** 128×128 monochrome noise, alpha ≤ 7/255, rendered once. */
@@ -218,6 +247,24 @@ export class Renderer {
     }
   }
 
+  /** Bright sparks (crashes, takedowns). */
+  spawnSparks(x: number, y: number, vx: number, vy: number, count: number): void {
+    for (let i = 0; i < count && this.dust.length < MAX_DUST + 60; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 80 + Math.random() * 260;
+      this.dust.push({
+        smoke: false,
+        spark: true,
+        x,
+        y,
+        vx: Math.cos(a) * sp + vx * 0.4,
+        vy: Math.sin(a) * sp + vy * 0.4,
+        age: 0,
+        size: 1 + Math.random() * 1.5,
+      });
+    }
+  }
+
   /** Tyre smoke from the rear wheels while drifting. */
   spawnSmoke(car: Car, drift: number, amount: number): void {
     if (this.dust.length >= MAX_DUST) return;
@@ -272,7 +319,7 @@ export class Renderer {
       p.vy *= drag;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-      if (p.age > (p.smoke ? SMOKE_LIFE : DUST_LIFE)) this.dust.splice(i, 1);
+      if (p.age > (p.spark ? SPARK_LIFE : p.smoke ? SMOKE_LIFE : DUST_LIFE)) this.dust.splice(i, 1);
     }
     for (let i = this.ripples.length - 1; i >= 0; i--) {
       this.ripples[i].age += dt;
@@ -310,18 +357,36 @@ export class Renderer {
       b: (vh - oy) / s + pad,
     };
 
-    this.drawProps(track, pal, view);
+    const popts: PropDrawOptions = { pal, night: fx.night, time: fx.time, pxScale: dpr * s };
+    this.drawProps(track, popts, view);
     this.drawRoad(track, pal, view);
     this.drawPads(track, pal, view, fx.time);
     this.drawTrails(pal);
     this.drawDust(pal);
     this.drawApexes(track, pal, view);
     this.drawOrbs(track, pal, view, fx.time);
+    this.drawPowerups(track, pal, view, fx.time);
+    this.drawTrafficCars(fx.traffic, popts, view);
     this.drawRipples(pal);
-    this.drawStreaks(car, pal, view, Math.max(fx.boost, fx.nitro));
     if (ghost && ghost.alpha > 0.002) this.drawGhost(ghost, pal, fx);
     this.drawCar(car, pal, glow, fx);
+    if (fx.shield > 0.01 || fx.magnet) this.drawAura(car, pal, fx);
+
+    // Night: darken the world, then add light sources on top.
+    if (fx.night > 0.05) this.drawNight(car, track, popts, view, fx);
+
+    this.drawSparks(pal);
+    this.drawStreaks(car, pal, view, Math.max(fx.boost, fx.nitro));
     this.drawPopups(pal, ox, oy);
+
+    // Vignette
+    if (this.vignette) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      const lightness = (pal.bg[0] + pal.bg[1] + pal.bg[2]) / 765;
+      ctx.globalAlpha = 0.42 - lightness * 0.3 + fx.night * 0.12;
+      ctx.drawImage(this.vignette, 0, 0, this.canvas.width, this.canvas.height);
+      ctx.globalAlpha = 1;
+    }
 
     // Grain, anchored to the world so it reads as asphalt/paper texture.
     if (this.grain) {
@@ -334,44 +399,169 @@ export class Renderer {
     }
   }
 
-  private drawProps(track: Track, pal: Palette, v: View): void {
+  private drawProps(track: Track, o: PropDrawOptions, v: View): void {
     const { ctx } = this;
-    const shade = css(pal.propShade);
-    const fill = css(pal.prop);
-    const alt = css(pal.propAlt);
     for (const p of track.props) {
-      if (p.x < v.l - 40 || p.x > v.r + 40 || p.y < v.t - 40 || p.y > v.b + 40) continue;
-      const r = p.r;
-      if (p.kind === 2) {
-        // Bush: small cluster.
-        ctx.fillStyle = shade;
-        ctx.beginPath();
-        ctx.arc(p.x + 2, p.y + 3, r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = fill;
-        for (let i = 0; i < 3; i++) {
-          const a = p.seed * 6.28 + i * 2.1;
-          ctx.beginPath();
-          ctx.arc(p.x + Math.cos(a) * r * 0.45, p.y + Math.sin(a) * r * 0.45, r * 0.62, 0, Math.PI * 2);
-          ctx.fill();
-        }
-        continue;
-      }
-      ctx.fillStyle = shade;
-      ctx.beginPath();
-      ctx.arc(p.x + r * 0.28, p.y + r * 0.42, r * 1.02, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = p.kind === 0 ? fill : alt;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-      ctx.fill();
-      if (p.kind === 0) {
-        ctx.fillStyle = alt;
-        ctx.beginPath();
-        ctx.arc(p.x - r * 0.22, p.y - r * 0.24, r * 0.56, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      const m = p.r + 40;
+      if (p.x < v.l - m || p.x > v.r + m || p.y < v.t - m || p.y > v.b + m) continue;
+      drawProp(ctx, p.kind, p.x, p.y, p.r, p.seed, o, p.angle);
     }
+  }
+
+  private drawTrafficCars(cars: readonly TrafficCar[], o: PropDrawOptions, v: View): void {
+    const { ctx } = this;
+    for (const c of cars) {
+      if (c.x < v.l - 60 || c.x > v.r + 60 || c.y < v.t - 60 || c.y > v.b + 60) continue;
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.rotate(c.angle + Math.PI / 2);
+      if (c.wreck) ctx.globalAlpha = Math.max(0, 1 - Math.max(0, c.wreckT - 1.6));
+      drawTraffic(ctx, c.style, { ...o, paint: c.paint, brake: c.brake, indicator: c.indicator, ghost: c.wreck });
+      ctx.restore();
+    }
+  }
+
+  private drawPowerups(track: Track, pal: Palette, v: View, time: number): void {
+    const { ctx } = this;
+    for (const u of track.powerups) {
+      if (u.x < v.l || u.x > v.r || u.y < v.t || u.y > v.b) continue;
+      if (u.taken && (u.age < 0 || u.age > 0.4)) continue;
+      const t = u.taken ? u.age / 0.4 : 0;
+      const bob = 1 + Math.sin(time * 4 + u.s) * 0.06;
+      const r = 11 * bob * (1 + t * 1.2);
+      ctx.save();
+      ctx.translate(u.x, u.y);
+      ctx.globalAlpha = 1 - t;
+      const halo = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 2.4);
+      halo.addColorStop(0, css(pal.accent, 0.35));
+      halo.addColorStop(1, css(pal.accent, 0));
+      ctx.fillStyle = halo;
+      ctx.fillRect(-r * 2.4, -r * 2.4, r * 4.8, r * 4.8);
+      ctx.fillStyle = css(pal.road);
+      ctx.strokeStyle = css(pal.accent);
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2 + time * 0.8;
+        ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.strokeStyle = css(pal.accent);
+      ctx.fillStyle = css(pal.accent);
+      ctx.lineWidth = 1.8;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      const k = r / 11;
+      ctx.scale(k, k);
+      ctx.beginPath();
+      if (u.kind === 0) {
+        // Magnet
+        ctx.moveTo(-4, -4);
+        ctx.lineTo(-4, 1);
+        ctx.arc(0, 1, 4, Math.PI, 0, true);
+        ctx.lineTo(4, -4);
+        ctx.stroke();
+      } else if (u.kind === 1) {
+        // Shield
+        ctx.moveTo(0, -5.5);
+        ctx.lineTo(4.5, -3.5);
+        ctx.quadraticCurveTo(4.2, 3, 0, 5.5);
+        ctx.quadraticCurveTo(-4.2, 3, -4.5, -3.5);
+        ctx.closePath();
+        ctx.stroke();
+      } else if (u.kind === 2) {
+        // Clock
+        ctx.arc(0, 0, 5, 0, Math.PI * 2);
+        ctx.moveTo(0, -3);
+        ctx.lineTo(0, 0);
+        ctx.lineTo(2.5, 1.5);
+        ctx.stroke();
+      } else {
+        ctx.font = '700 8px -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('2×', 0, 0.5);
+      }
+      ctx.restore();
+    }
+  }
+
+  private drawAura(car: Car, pal: Palette, fx: FrameFx): void {
+    const { ctx } = this;
+    if (fx.shield > 0.01) {
+      const pulse = 0.85 + 0.15 * Math.sin(fx.time * 6);
+      ctx.strokeStyle = css(pal.accent, 0.55 * fx.shield * pulse);
+      ctx.fillStyle = css(pal.accent, 0.08 * fx.shield);
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.arc(car.x, car.y, 30, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (fx.magnet) {
+      const t = (fx.time * 1.4) % 1;
+      ctx.strokeStyle = css(pal.accent, 0.35 * (1 - t));
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(car.x, car.y, 30 + t * 90, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  private drawSparks(pal: Palette): void {
+    const { ctx } = this;
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (const p of this.dust) {
+      if (!p.spark) continue;
+      const life = 1 - p.age / SPARK_LIFE;
+      ctx.globalAlpha = life;
+      ctx.strokeStyle = life > 0.5 ? 'rgba(255,240,210,1)' : css(pal.accent);
+      ctx.lineWidth = p.size;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - p.vx * 0.035, p.y - p.vy * 0.035);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  private drawNight(car: Car, track: Track, o: PropDrawOptions, v: View, fx: FrameFx): void {
+    const { ctx } = this;
+    const pal = o.pal;
+    ctx.save();
+    // Darkness wash (deep blue-black), strength by zone darkness.
+    ctx.fillStyle = `rgba(4,6,14,${(0.5 * fx.night).toFixed(3)})`;
+    ctx.fillRect(v.l, v.t, v.r - v.l, v.b - v.t);
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of track.props) {
+      if (p.x < v.l - 80 || p.x > v.r + 80 || p.y < v.t - 80 || p.y > v.b + 80) continue;
+      drawPropLight(ctx, p.kind, p.x, p.y, p.r, p.seed, o, p.angle);
+    }
+    for (const c of fx.traffic) {
+      if (c.wreck || c.x < v.l - 160 || c.x > v.r + 160 || c.y < v.t - 160 || c.y > v.b + 160) continue;
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.rotate(c.angle + Math.PI / 2);
+      drawTrafficLights(ctx, c.style, { ...o, paint: c.paint, brake: c.brake, indicator: c.indicator });
+      ctx.restore();
+    }
+    // Orbs and apex arcs glow in the dark.
+    for (const orb of track.orbs) {
+      if (orb.taken || orb.x < v.l || orb.x > v.r || orb.y < v.t || orb.y > v.b) continue;
+      const g = ctx.createRadialGradient(orb.x, orb.y, 0, orb.x, orb.y, 16);
+      g.addColorStop(0, css(pal.accent, 0.35 * fx.night));
+      g.addColorStop(1, css(pal.accent, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(orb.x - 16, orb.y - 16, 32, 32);
+    }
+    // Player headlights.
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.angle + fx.drift + Math.PI / 2);
+    drawHeadlights(ctx, Math.min(1, fx.night * 1.3), this.dpr * this.scale);
+    ctx.restore();
   }
 
   private drawPads(track: Track, pal: Palette, v: View, time: number): void {
@@ -593,6 +783,7 @@ export class Renderer {
     ctx.save();
     ctx.fillStyle = css(pal.dust, 1 / pal.dust[3]);
     for (const p of this.dust) {
+      if (p.spark) continue;
       const life = 1 - p.age / (p.smoke ? SMOKE_LIFE : DUST_LIFE);
       ctx.globalAlpha = p.smoke ? pal.dust[3] * 0.9 * life * life : pal.dust[3] * life;
       ctx.beginPath();
