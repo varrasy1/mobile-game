@@ -511,8 +511,11 @@ function step(now: number): void {
     steer = autopilotSteer(car, track, q);
     lane = q.lateral;
   } else {
-    const bot = (window as { __botSteer?: () => number }).__botSteer;
-    const cmd = import.meta.env.DEV && bot ? bot() : input.steer;
+    let cmd = input.steer;
+    if (import.meta.env.DEV) {
+      const bot = (window as { __botSteer?: () => number }).__botSteer;
+      if (bot) cmd = bot();
+    }
     const limit = track.halfWidth + LANE_OVERHANG;
     lane = Math.max(-limit, Math.min(limit, lane + cmd * LANE_SPEED * dt));
     steer = followSteer(car, track, q, lane);
