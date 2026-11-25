@@ -1,0 +1,17 @@
+{
+  "name": "flowline",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "FLOWLINE – a minimalist, chill endless driving PWA.",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}
