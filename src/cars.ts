@@ -141,6 +141,16 @@ export interface DrawCarOptions {
   pxScale: number;
   /** Silhouette only (body in pal.carBody); caller sets globalAlpha. */
   ghost?: boolean;
+  /** Custom paint (hex) from the garage; omitted = the model's factory paint. */
+  paint?: string;
+}
+
+/** Perceived lightness 0…1 of a #rrggbb colour. */
+function lightness(hex: string): number {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
 }
 
 // ─── Paint ────────────────────────────────────────────────────────────────
@@ -157,6 +167,13 @@ interface GlossSet {
 const GLOSS_DARK: GlossSet = { hi: 0.32, spec: 0.45, rim: 0.28, lo: 0.35 };
 const GLOSS_LIGHT: GlossSet = { hi: 0.55, spec: 0.7, rim: 0.4, lo: 0.16 };
 const GLOSS_MID: GlossSet = { hi: 0.4, spec: 0.55, rim: 0.32, lo: 0.26 };
+
+/** Gloss strength suited to a custom paint (dark paints get deeper lacquer). */
+function glossFor(paint: string | undefined, fallback: GlossSet): GlossSet {
+  if (!paint) return fallback;
+  const l = lightness(paint);
+  return l < 0.3 ? GLOSS_DARK : l > 0.7 ? GLOSS_LIGHT : GLOSS_MID;
+}
 
 const WEDGE = { body: '#E03A3E', detail: '#16181C' };
 const FORMULA = { body: '#2C5FE0', detail: '#F2C232', dark: '#101216' };
@@ -500,9 +517,10 @@ function drawGT(ctx: CanvasRenderingContext2D, g: Geo, o: DrawCarOptions): void 
   wheel(ctx, -9.1, 11.5, 5, 9.2, 1.7, 0);
   wheel(ctx, 9.1, 11.5, 5, 9.2, 1.7, 0);
 
-  ctx.fillStyle = css(pal.carBody);
+  ctx.fillStyle = o.paint ?? css(pal.carBody);
   ctx.fill(g.body);
-  gloss(ctx, g, o.worldAngle, pal.carBody[0] < 128 ? GLOSS_DARK : GLOSS_LIGHT, 22);
+  const gtDark = o.paint ? lightness(o.paint) < 0.5 : pal.carBody[0] < 128;
+  gloss(ctx, g, o.worldAngle, gtDark ? GLOSS_DARK : GLOSS_LIGHT, 22);
 
   // Accent pinstripe down the spine.
   ctx.strokeStyle = css(pal.accent, 0.85);
@@ -562,9 +580,9 @@ function drawWedge(ctx: CanvasRenderingContext2D, g: Geo, o: DrawCarOptions): vo
   contactShadow(ctx, o, -9.8, -19.5, 19.6, 40, 6);
   wheels(ctx, o, 8.8, -12.6, 4.6, 8.4, 9.2, 12.5, 5.2, 9, 1.4);
 
-  ctx.fillStyle = WEDGE.body;
+  ctx.fillStyle = o.paint ?? WEDGE.body;
   ctx.fill(g.body);
-  gloss(ctx, g, o.worldAngle, GLOSS_MID, 23);
+  gloss(ctx, g, o.worldAngle, glossFor(o.paint, GLOSS_MID), 23);
 
   // Flat facets: fender tops and rear haunches fall away from the light.
   ctx.fillStyle = 'rgba(0,0,0,0.13)';
@@ -680,9 +698,9 @@ function drawFormula(ctx: CanvasRenderingContext2D, g: Geo, o: DrawCarOptions): 
     ctx.restore();
   }
 
-  ctx.fillStyle = FORMULA.body;
+  ctx.fillStyle = o.paint ?? FORMULA.body;
   ctx.fill(g.body);
-  gloss(ctx, g, o.worldAngle, GLOSS_MID, 23);
+  gloss(ctx, g, o.worldAngle, glossFor(o.paint, GLOSS_MID), 23);
 
   // Wing flaps + endplates.
   ctx.strokeStyle = 'rgba(0,0,0,0.32)';
@@ -749,7 +767,7 @@ function drawMuscle(ctx: CanvasRenderingContext2D, g: Geo, o: DrawCarOptions): v
   contactShadow(ctx, o, -10.8, -21.6, 21.6, 44, 7);
   wheels(ctx, o, 9.2, -13.6, 4.8, 8.8, 9.2, 13.4, 6, 10, 1.6);
 
-  ctx.fillStyle = MUSCLE.body;
+  ctx.fillStyle = o.paint ?? MUSCLE.body;
   ctx.fill(g.body);
 
   // Twin racing stripes, nose to tail.
@@ -760,7 +778,7 @@ function drawMuscle(ctx: CanvasRenderingContext2D, g: Geo, o: DrawCarOptions): v
   ctx.fillRect(1.3, -24, 2.4, 48);
   ctx.restore();
 
-  gloss(ctx, g, o.worldAngle, GLOSS_MID, 25);
+  gloss(ctx, g, o.worldAngle, glossFor(o.paint, GLOSS_MID), 25);
 
   // Hood scoop.
   ctx.fillStyle = 'rgba(255,255,255,0.08)';
@@ -845,9 +863,9 @@ function drawHyper(ctx: CanvasRenderingContext2D, g: Geo, o: DrawCarOptions): vo
   }
   ctx.stroke();
 
-  ctx.fillStyle = HYPER.body;
+  ctx.fillStyle = o.paint ?? HYPER.body;
   ctx.fill(g.body);
-  gloss(ctx, g, o.worldAngle, GLOSS_LIGHT, 23);
+  gloss(ctx, g, o.worldAngle, glossFor(o.paint, GLOSS_LIGHT), 23);
 
   // Sculpted side intakes.
   ctx.fillStyle = HYPER.detail;

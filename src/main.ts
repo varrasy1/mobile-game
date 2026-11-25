@@ -1,7 +1,18 @@
 import { AudioEngine } from './audio';
 import { BASE_SPEED, Car, InputController, TOP_SPEED, autopilotSteer, followSteer } from './car';
 import { CARS, carById, drawCar as drawCarModel, type CarModel } from './cars';
-import { Progress, emptyRun, type Mission, type RunStats } from './progress';
+import {
+  PAINTS,
+  Progress,
+  TUNE_MAX,
+  TUNE_STATS,
+  TUNE_STEP,
+  emptyRun,
+  paintById,
+  tuneCost,
+  type Mission,
+  type RunStats,
+} from './progress';
 import { TRAFFIC_PAINTS, TRAFFIC_STYLES } from './props';
 import { Renderer, type GhostPose } from './renderer';
 import {
@@ -99,13 +110,24 @@ let speedBonus = 0;
 let laneSpeed = 240;
 let nitroFactor = 1;
 
+/** Factory stats plus garage tuning. */
+function effectiveStats(m: CarModel): { speed: number; handling: number; nitro: number } {
+  const t = progress.tune(m.id);
+  return {
+    speed: m.stats.speed + t.speed * TUNE_STEP,
+    handling: m.stats.handling + t.handling * TUNE_STEP,
+    nitro: m.stats.nitro + t.nitro * TUNE_STEP,
+  };
+}
+
 function applyModel(m: CarModel): void {
   model = m;
-  renderer.setModel(m);
-  speedBonus = (m.stats.speed - 2) * 14;
-  laneSpeed = 220 + (m.stats.handling - 2) * 28;
-  car.handling = (m.stats.handling - 2) * 0.12;
-  nitroFactor = 0.8 + m.stats.nitro * 0.12;
+  const st = effectiveStats(m);
+  renderer.setModel(m, paintById(progress.tune(m.id).paint)?.hex ?? null);
+  speedBonus = (st.speed - 2) * 14;
+  laneSpeed = 220 + (st.handling - 2) * 28;
+  car.handling = (st.handling - 2) * 0.12;
+  nitroFactor = 0.8 + st.nitro * 0.12;
 }
 applyModel(model);
 
@@ -282,6 +304,13 @@ audioBtn.addEventListener('click', () => {
 let garageOpen = false;
 let garageIdx = Math.max(0, CARS.findIndex((c) => c.id === model.id));
 
+/** Garage paint preview: undefined = car's current paint, null = factory. */
+let previewPaint: string | null | undefined;
+
+function tunePips(level: number): string {
+  return Array.from({ length: TUNE_MAX }, (_, i) => `<u class="${i < level ? 'on' : ''}"></u>`).join('');
+}
+
 function statBars(v: number): string {
   return Array.from({ length: 5 }, (_, i) => `<i class="${i < v ? 'on' : ''}"></i>`).join('');
 }
@@ -291,19 +320,54 @@ function renderGarage(): void {
   const owned = progress.owned.includes(c.id);
   const selected = progress.selected === c.id;
   const levelOk = progress.level >= c.level;
+  const t = progress.tune(c.id);
   $('g-coins').textContent = `${COIN} ${fmt(progress.coins)}`;
   $('g-level').textContent = `LV ${progress.level}`;
   $('g-name').textContent = c.name;
   $('g-tag').textContent = c.tagline;
   $('g-count').textContent = `${garageIdx + 1} / ${CARS.length}`;
-  $('g-stats').innerHTML = `
-    <div><span>SPEED</span><b>${statBars(c.stats.speed)}</b></div>
-    <div><span>HANDLING</span><b>${statBars(c.stats.handling)}</b></div>
-    <div><span>NITRO</span><b>${statBars(c.stats.nitro)}</b></div>`;
+  const labels = { speed: 'SPEED', handling: 'HANDLING', nitro: 'NITRO' } as const;
+  $('g-stats').innerHTML = TUNE_STATS.map((stat) => {
+    const lvl = t[stat];
+    let btn = '';
+    if (owned) {
+      if (lvl >= TUNE_MAX) btn = '<button type="button" class="g-up max" disabled>MAX</button>';
+      else {
+        const cost = tuneCost(lvl);
+        btn = `<button type="button" class="g-up${progress.coins >= cost ? '' : ' poor'}" data-stat="${stat}">▲ ${COIN}${fmt(cost)}</button>`;
+      }
+    }
+    return `<div><span>${labels[stat]}</span><b>${statBars(c.stats[stat])}</b><em>${tunePips(lvl)}</em>${btn}</div>`;
+  }).join('');
+
+  const current = previewPaint === undefined ? t.paint : previewPaint;
+  const swatches = [
+    `<button type="button" class="sw factory${current === null ? ' sel' : ''}" data-paint="" aria-label="Factory paint"></button>`,
+    ...PAINTS.map(
+      (p) =>
+        `<button type="button" class="sw${current === p.id ? ' sel' : ''}${progress.paints.includes(p.id) ? '' : ' lockedp'}" data-paint="${p.id}" style="--c:${p.hex}" aria-label="${p.name}"></button>`,
+    ),
+  ];
+  const paintsEl = $('g-paints');
+  paintsEl.innerHTML = owned ? swatches.join('') : '';
+  const pDef = paintById(current ?? null);
+  $('g-paint-name').textContent = owned ? (pDef ? pDef.name : 'Factory paint') : '';
+
   const btn = $<HTMLButtonElement>('g-action');
   btn.disabled = false;
   btn.className = '';
-  if (selected) {
+  btn.dataset.mode = '';
+  if (owned && pDef && !progress.paints.includes(pDef.id)) {
+    btn.dataset.mode = 'paint';
+    if (progress.coins >= pDef.price) {
+      btn.textContent = `BUY PAINT ${COIN} ${fmt(pDef.price)}`;
+      btn.className = 'buy';
+    } else {
+      btn.textContent = `PAINT ${COIN} ${fmt(pDef.price)}`;
+      btn.disabled = true;
+      btn.className = 'locked';
+    }
+  } else if (selected) {
     btn.textContent = 'SELECTED';
     btn.disabled = true;
   } else if (owned) btn.textContent = 'SELECT';
@@ -324,6 +388,7 @@ function renderGarage(): void {
 function openGarage(): void {
   if (state === 'PLAYING' || state === 'ENDING') return;
   garageOpen = true;
+  previewPaint = undefined;
   garageIdx = Math.max(0, CARS.findIndex((c) => c.id === model.id));
   renderGarage();
   garageEl.classList.add('show');
@@ -346,16 +411,55 @@ document.querySelectorAll<HTMLButtonElement>('.garage-open').forEach((b) =>
 $('g-close').addEventListener('click', closeGarage);
 $('g-prev').addEventListener('click', () => {
   garageIdx = (garageIdx + CARS.length - 1) % CARS.length;
+  previewPaint = undefined;
   renderGarage();
   audio.blip(2, 0.03);
 });
 $('g-next').addEventListener('click', () => {
   garageIdx = (garageIdx + 1) % CARS.length;
+  previewPaint = undefined;
   renderGarage();
   audio.blip(4, 0.03);
 });
+$('g-stats').addEventListener('click', (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLButtonElement>('.g-up');
+  const stat = b?.dataset.stat as (typeof TUNE_STATS)[number] | undefined;
+  if (!stat) return;
+  const c = CARS[garageIdx];
+  if (progress.upgrade(c.id, stat)) {
+    audio.blip(4 + progress.tune(c.id)[stat], 0.07);
+    navigator.vibrate?.(12);
+    if (progress.selected === c.id) applyModel(c);
+  } else audio.blip(-3, 0.04);
+  renderGarage();
+});
+$('g-paints').addEventListener('click', (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLButtonElement>('.sw');
+  if (!b) return;
+  const c = CARS[garageIdx];
+  const id = b.dataset.paint || null;
+  if (id === null || progress.paints.includes(id)) {
+    progress.setPaint(c.id, id);
+    previewPaint = undefined;
+    if (progress.selected === c.id) applyModel(c);
+  } else previewPaint = id;
+  audio.blip(3, 0.03);
+  renderGarage();
+});
 $('g-action').addEventListener('click', () => {
   const c = CARS[garageIdx];
+  const btn = $<HTMLButtonElement>('g-action');
+  if (btn.dataset.mode === 'paint' && typeof previewPaint === 'string') {
+    if (progress.buyPaint(previewPaint)) {
+      progress.setPaint(c.id, previewPaint);
+      previewPaint = undefined;
+      audio.chord();
+      navigator.vibrate?.([12, 40, 12]);
+      if (progress.selected === c.id) applyModel(c);
+    }
+    renderGarage();
+    return;
+  }
   if (progress.owned.includes(c.id)) progress.select(c.id);
   else if (progress.level >= c.level && progress.buy(c.id, c.price)) {
     audio.chord();
@@ -392,7 +496,13 @@ function drawGaragePreview(): void {
     time,
     worldAngle: angle,
     pxScale: dpr * scale,
+    ...(previewHex(c) ? { paint: previewHex(c) as string } : {}),
   });
+}
+
+function previewHex(c: CarModel): string | undefined {
+  const id = previewPaint === undefined ? progress.tune(c.id).paint : previewPaint;
+  return paintById(id)?.hex;
 }
 
 // ───────────────────────── state machine ─────────────────────────

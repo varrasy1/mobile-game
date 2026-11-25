@@ -204,8 +204,11 @@ export class Renderer {
 
   // ───────────────────────── effects ─────────────────────────
 
-  setModel(model: CarModel): void {
+  private paint: string | null = null;
+
+  setModel(model: CarModel, paint: string | null = null): void {
     this.model = model;
+    this.paint = paint;
   }
 
   /** World position of a local-frame point (x right, y rearward) on the car body incl. drift yaw. */
@@ -873,6 +876,7 @@ export class Renderer {
       time: fx.time,
       worldAngle: angle,
       pxScale: this.dpr * this.scale,
+      ...(this.paint ? { paint: this.paint } : {}),
     });
     ctx.restore();
   }

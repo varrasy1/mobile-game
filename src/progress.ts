@@ -67,6 +67,50 @@ export interface Mission {
   done: boolean;
 }
 
+// ─── Tuning ───
+
+export type TuneStat = 'speed' | 'handling' | 'nitro';
+export const TUNE_STATS: TuneStat[] = ['speed', 'handling', 'nitro'];
+export const TUNE_MAX = 5;
+/** Each tuning level adds this much to the car's 1–5 stat. */
+export const TUNE_STEP = 0.5;
+
+export interface CarTune {
+  speed: number;
+  handling: number;
+  nitro: number;
+  paint: string | null;
+}
+
+/** Coins for the next tuning level (level = current level, 0-based). */
+export function tuneCost(level: number): number {
+  return Math.round((350 * Math.pow(1.6, level)) / 10) * 10;
+}
+
+export interface PaintDef {
+  id: string;
+  name: string;
+  hex: string;
+  price: number;
+}
+
+export const PAINTS: PaintDef[] = [
+  { id: 'signal', name: 'Signal Red', hex: '#E03A3E', price: 300 },
+  { id: 'solar', name: 'Solar Gold', hex: '#F0B23A', price: 300 },
+  { id: 'lime', name: 'Acid Lime', hex: '#9BD23C', price: 400 },
+  { id: 'petrol', name: 'Petrol', hex: '#178C84', price: 400 },
+  { id: 'cobalt', name: 'Cobalt', hex: '#2C5FE0', price: 400 },
+  { id: 'violet', name: 'Ultraviolet', hex: '#7B4FD6', price: 600 },
+  { id: 'rose', name: 'Hot Rose', hex: '#E2557F', price: 600 },
+  { id: 'porcelain', name: 'Porcelain', hex: '#F4F1EA', price: 500 },
+  { id: 'obsidian', name: 'Obsidian', hex: '#1A1D22', price: 800 },
+  { id: 'titanium', name: 'Titanium', hex: '#A9B1BC', price: 800 },
+];
+
+export function paintById(id: string | null): PaintDef | undefined {
+  return id ? PAINTS.find((p) => p.id === id) : undefined;
+}
+
 function fmt(n: number): string {
   return n.toLocaleString('en-US');
 }
@@ -90,6 +134,8 @@ interface Saved {
   selected: string;
   missions: Mission[];
   nextSeq: number;
+  tuning: Record<string, CarTune>;
+  paints: string[];
 }
 
 export class Progress {
@@ -98,6 +144,8 @@ export class Progress {
   owned: string[] = ['gt'];
   selected = 'gt';
   missions: Mission[] = [];
+  tuning: Record<string, CarTune> = {};
+  paints: string[] = [];
   private nextSeq = 0;
 
   constructor() {
@@ -111,6 +159,8 @@ export class Progress {
         if (typeof s.selected === 'string' && this.owned.includes(s.selected)) this.selected = s.selected;
         if (Array.isArray(s.missions)) this.missions = s.missions.slice(0, 3);
         this.nextSeq = Math.max(0, Math.floor(s.nextSeq ?? 0));
+        if (s.tuning && typeof s.tuning === 'object') this.tuning = s.tuning;
+        if (Array.isArray(s.paints)) this.paints = s.paints.filter((x) => typeof x === 'string');
       }
     } catch {
       /* fresh profile */
@@ -141,6 +191,8 @@ export class Progress {
       selected: this.selected,
       missions: this.missions,
       nextSeq: this.nextSeq,
+      tuning: this.tuning,
+      paints: this.paints,
     };
     try {
       localStorage.setItem(KEY, JSON.stringify(s));
@@ -183,6 +235,43 @@ export class Progress {
     this.coins -= price;
     this.owned.push(id);
     this.selected = id;
+    this.save();
+    return true;
+  }
+
+  tune(carId: string): CarTune {
+    let t = this.tuning[carId];
+    if (!t) {
+      t = { speed: 0, handling: 0, nitro: 0, paint: null };
+      this.tuning[carId] = t;
+    }
+    return t;
+  }
+
+  /** Buys the next tuning level for a stat. */
+  upgrade(carId: string, stat: TuneStat): boolean {
+    const t = this.tune(carId);
+    if (!this.owned.includes(carId) || t[stat] >= TUNE_MAX) return false;
+    const cost = tuneCost(t[stat]);
+    if (this.coins < cost) return false;
+    this.coins -= cost;
+    t[stat]++;
+    this.save();
+    return true;
+  }
+
+  /** Applies an owned paint (or null = factory) to a car. */
+  setPaint(carId: string, paintId: string | null): void {
+    if (paintId && !this.paints.includes(paintId)) return;
+    this.tune(carId).paint = paintId;
+    this.save();
+  }
+
+  buyPaint(paintId: string): boolean {
+    const p = paintById(paintId);
+    if (!p || this.paints.includes(paintId) || this.coins < p.price) return false;
+    this.coins -= p.price;
+    this.paints.push(paintId);
     this.save();
     return true;
   }
