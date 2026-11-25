@@ -1,5 +1,5 @@
-/* FLOWLINE service worker — cache-first with network fallback. */
-const CACHE = 'flowline-v1';
+/* FLOWLINE service worker — pages network-first, hashed assets cache-first. */
+const CACHE = 'flowline-v2';
 const CORE = ['./', './index.html', './manifest.json', './icon.svg', './icon-192.png', './icon-512.png', './icon-180.png'];
 
 self.addEventListener('install', (event) => {
@@ -30,18 +30,33 @@ function fetchAndCache(request) {
   });
 }
 
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   if (request.method !== 'GET' || new URL(request.url).origin !== self.location.origin) return;
 
   if (request.mode === 'navigate') {
-    // Serve the cached shell instantly, refresh it in the background so the
-    // next launch picks up a new deploy (hashed assets follow automatically).
+    // Network-first (short timeout) so every launch picks up a new deploy;
+    // offline, fall back to the cached shell. Hashed assets stay cache-first.
     event.respondWith(
-      caches.match(request, { ignoreSearch: true }).then((cached) => {
-        const network = fetchAndCache(request).catch(() => cached || caches.match('./index.html'));
-        return cached || network;
-      }),
+      withTimeout(fetchAndCache(request), 3500).catch(() =>
+        caches.match(request, { ignoreSearch: true }).then((c) => c || caches.match('./index.html')),
+      ),
     );
     return;
   }
