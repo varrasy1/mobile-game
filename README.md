@@ -8,13 +8,13 @@ npm run dev        # local dev server
 npm run build      # typecheck + production build → dist/
 ```
 
-**Controls:** hold **into** a corner to drift (left/right half of the screen, or drag) — the car follows the bend while the tail steps out; release to catch it. Hands off, a lane assist keeps your line but can't take real corners. A short hold on a straight changes lanes. **N₂O** (or `Space`) fires nitro. Desktop: `←/A` `→/D`.
+**Controls:** hold the left / right half of the screen to steer into a drift; release to grip up and drive straight (drag works too for finer control). Desktop: `←/A` `→/D`, `Space` for nitro. The drift radius is the same at every speed — corners are about timing: turn in at the right moment, release when the nose points down the next straight.
 
-**Loop (arcade):** the clock counts down; checkpoints every 1 km add time. Earn time and points with drifts (GOOD → GREAT → INSANE, chained drifts multiply), PERFECT apexes, light chains, close calls in traffic and power-ups (magnet, shield, +time, 2×). Crashing costs 3 s — unless you're on nitro or shielded: then it's a takedown.
+**Loop (arcade):** a track-up course of straights and crisp 90° corners with kerbs. Every corner is graded — PERFECT (drifted, straight exit), CLEAN or SLOPPY (touched the wall). Clean corners build a combo up to ×9 that multiplies all points; touching the barrier costs the combo, leaving the course ends the run (a shield saves you once). Each 1 km zone is faster.
 
-**World:** every checkpoint drives into a new zone — Coast, Desert Dusk, Pine Forest, Neon City (night, headlights, street lamps), Snowfield, Volcano.
+**World:** zones cycle through Coast, Desert Dusk, Pine Forest, Neon City (night), Snowfield and Volcano.
 
-**Progression:** XP/levels, coins, three rotating missions, a garage of five cars (Aero, Vector, Apex, Torque, Zenith) with speed/handling/nitro tuning (5 levels each) and a paint shop.
+**Progression:** XP/levels, coins (lights, zones, missions, level-ups), three rotating missions, five cars with speed/handling/nitro tuning and a paint shop.
 
 ## Deploy (GitHub Pages)
 

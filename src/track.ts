@@ -14,8 +14,6 @@ export const ROAD_HALF_WIDTH = 68;
 export const NODES_AHEAD = 260;
 export const PRUNE_BEHIND = 450;
 
-const HEADING_LIMIT = 0.44 * Math.PI;
-const HEADING_SOFT = 0.38 * Math.PI;
 const APEX_HALF_NODES = 4; // 9 nodes → 8 × 14 = 112px ≈ 110px span
 export const APEX_INSET = 7;
 
@@ -180,10 +178,11 @@ interface Pending {
 
 const SCENERY_LAG_NODES = 150;
 
-type SegmentType = 'sweep' | 'corner' | 'straight';
+type SegmentType = 'corner' | 'straight';
 
-/** Ramp length (px) at each end of a corner, for smooth curvature build-up. */
-const CORNER_RAMP = 56;
+/** Centre-line radius of a standard 90° corner and of a fast sweeper. */
+export const CORNER_RADIUS = 125;
+const SWEEPER_RADIUS = 175;
 
 export interface Corner {
   s0: number;
@@ -197,6 +196,8 @@ interface Segment {
   K: number;
   L: number;
   pos: number;
+  /** Exact heading at the end of the segment (snapped to avoid drift). */
+  endHeading: number;
 }
 
 /** Small, fast deterministic PRNG. */
@@ -228,7 +229,6 @@ export class Track {
 
   private heading = 0;
   private seg: Segment;
-  private lastApexS = -Infinity;
   private lastType: SegmentType = 'straight';
   private rng: () => number;
   private hint = 0;
@@ -236,7 +236,7 @@ export class Track {
   constructor(seed: number) {
     this.rng = mulberry32(seed);
     // Calm opening straight so the title screen starts relaxed.
-    this.seg = { type: 'straight', K: 0, L: 700, pos: 0 };
+    this.seg = { type: 'straight', K: 0, L: 900, pos: 0, endHeading: 0 };
     this.nodes.push({ x: 0, y: 0, s: 0, heading: 0, k: 0, nx: 1, ny: 0 });
     this.update(0);
   }
@@ -275,98 +275,79 @@ export class Track {
 
   // ───────────────────────── generation ─────────────────────────
 
+  /**
+   * Course layout: straights joined by crisp 90° corners. Headings are only
+   * up / left / right (never down), so the course can never cross itself:
+   * from "up" a corner turns left or right; from a sideways run the only
+   * corner turns back up. Corner + corner gives a chicane.
+   */
   private nextSegment(): void {
     const r = this.rng;
     const h = this.heading;
     const here = this.lastS;
     const prev = this.lastType;
-    let type: SegmentType;
-    const roll = r();
-    if (prev === 'corner') type = roll < 0.55 ? 'straight' : roll < 0.85 ? 'corner' : 'sweep';
-    else type = roll < 0.8 ? 'corner' : 'sweep';
-    // Gentle opening: the first stretch flows before the real corners start.
-    if (here < 1400) type = 'sweep';
+    const node = this.nodes[this.nodes.length - 1];
 
-    let L = 0;
-    let K = 0;
-    const towardCentre = Math.abs(h) > 0.12 * Math.PI && r() < 0.85;
-    let sign = towardCentre ? -Math.sign(h) : r() < 0.5 ? -1 : 1;
-    // Chicanes: a corner straight after a corner flips direction.
-    if (type === 'corner' && prev === 'corner') sign = -Math.sign(this.seg.K) || sign;
+    let type: SegmentType;
+    if (prev === 'corner') type = Math.abs(h) > 0.1 && r() < 0.35 ? 'corner' : 'straight';
+    else type = 'corner';
 
     if (type === 'straight') {
-      L = 200 + r() * 320;
-    } else if (type === 'sweep') {
-      L = 420 + r() * 380;
-      K = 0.0018 + r() * 0.0016;
-      const room = sign > 0 ? HEADING_SOFT - h : h + HEADING_SOFT;
-      const maxK = (Math.max(0, room) * Math.PI) / (2 * L);
-      if (maxK < 0.0012) sign = -sign;
-      K = Math.min(K, (Math.max(0, sign > 0 ? HEADING_SOFT - h : h + HEADING_SOFT) * Math.PI) / (2 * L));
-    } else {
-      const early = Math.min(1, Math.max(0, (here - 1400) / 6000));
-      K = 0.0045 + r() * (0.0015 + 0.0018 * early);
-      let turn = (0.3 + r() * (0.25 + 0.2 * early)) * Math.PI;
-      const limit = 0.42 * Math.PI;
-      let room = sign > 0 ? limit - h : h + limit;
-      if (room < 0.22 * Math.PI) {
-        sign = -sign;
-        room = sign > 0 ? limit - h : h + limit;
+      const up = Math.abs(h) < 0.1;
+      const L = up ? 240 + r() * 420 : 150 + r() * 260;
+      this.lastType = type;
+      this.seg = { type, K: 0, L, pos: 0, endHeading: h };
+      if (up && L > 430 && here > 1600 && r() < 0.5) {
+        this.pending.push({ s: here + L * 0.45, lat: (r() - 0.5) * 50, kind: 'pad', idx: 0 });
       }
-      turn = Math.min(turn, room);
-      L = turn / K + CORNER_RAMP;
-      if (L < CORNER_RAMP * 2 + 30) {
-        type = 'straight';
-        L = 260;
-        K = 0;
-      }
+      return;
     }
 
-    this.lastType = type;
-    this.seg = { type, K: K * sign, L, pos: 0 };
-
-    if (type === 'corner') {
-      const mid = here + L / 2;
-      this.corners.push({ s0: here, s1: here + L, side: sign });
-      if (mid - this.lastApexS > 240) {
-        this.lastApexS = mid;
-        this.pending.push({ s: mid, lat: 0, kind: 'apex', idx: sign });
-        // Light chain on the drift line: outside → inside at the apex → outside.
-        const span = L / 2 + 110;
-        let idx = 0;
-        for (let d = -span; d <= span * 0.55; d += 30) {
-          const u = d / span;
-          const bell = Math.exp(-u * u * 3.2);
-          this.pending.push({ s: mid + d, lat: sign * (-34 + 82 * bell), kind: 'orb', idx: idx++ });
-        }
-      }
+    // Corner direction: sideways runs must turn back up; from "up" pick a
+    // side, leaning back toward the course's centre line.
+    let sign: number;
+    if (h > 0.1) sign = -1;
+    else if (h < -0.1) sign = 1;
+    else {
+      const drift = node.x / 900;
+      sign = r() < 0.5 - Math.max(-0.35, Math.min(0.35, drift)) ? 1 : -1;
     }
+    const R = r() < 0.22 ? SWEEPER_RADIUS : CORNER_RADIUS;
+    // Whole number of nodes so the heading lands exactly on 90°.
+    const n = Math.max(4, Math.round((Math.PI / 2) * R / NODE_SPACING));
+    const L = n * NODE_SPACING;
+    const K = (Math.PI / 2) / L;
+    this.lastType = 'corner';
+    this.seg = { type: 'corner', K: K * sign, L, pos: 0, endHeading: h + sign * (Math.PI / 2) };
 
-    // Boost pads on straights.
-    if (here > 1800 && type === 'straight' && L > 300 && r() < 0.55) {
-      this.pending.push({ s: here + L * 0.35, lat: (r() - 0.5) * 56, kind: 'pad', idx: 0 });
+    const mid = here + L / 2;
+    this.corners.push({ s0: here, s1: here + L, side: sign });
+    this.pending.push({ s: mid, lat: 0, kind: 'apex', idx: sign });
+    // Light chain on the drift line: outside → apex → outside.
+    const span = L / 2 + 90;
+    let idx = 0;
+    for (let d = -span; d <= span * 0.6; d += 28) {
+      const u = d / span;
+      const bell = Math.exp(-u * u * 3.2);
+      this.pending.push({ s: mid + d, lat: sign * (-30 + 78 * bell), kind: 'orb', idx: idx++ });
     }
   }
 
   private curvatureAtSegment(): number {
-    const { type, K, L, pos } = this.seg;
-    if (type === 'sweep') return K * Math.sin((Math.PI * pos) / L);
-    if (type === 'corner') {
-      const e = Math.min(1, pos / CORNER_RAMP, (L - pos) / CORNER_RAMP);
-      const t = Math.max(0, e);
-      return K * t * t * (3 - 2 * t);
-    }
-    return 0;
+    return this.seg.type === 'corner' ? this.seg.K : 0;
   }
 
   private addNode(): void {
-    if (this.seg.pos >= this.seg.L) this.nextSegment();
+    if (this.seg.pos >= this.seg.L - 1e-6) {
+      this.heading = this.seg.endHeading;
+      this.nextSegment();
+    }
     const k = this.curvatureAtSegment();
     this.seg.pos += NODE_SPACING;
 
     const prev = this.nodes[this.nodes.length - 1];
     const mid = this.heading + (k * NODE_SPACING) / 2;
-    this.heading = Math.max(-HEADING_LIMIT, Math.min(HEADING_LIMIT, this.heading + k * NODE_SPACING));
+    this.heading += k * NODE_SPACING;
     const node: TrackNode = {
       x: prev.x + Math.sin(mid) * NODE_SPACING,
       y: prev.y - Math.cos(mid) * NODE_SPACING,
@@ -380,7 +361,8 @@ export class Track {
     if (node.s > this.nextPowerS) {
       const r = this.rng;
       const lanes = [-36, 0, 36];
-      this.pending.push({ s: node.s + 40, lat: lanes[Math.floor(r() * 3)], kind: 'power', idx: Math.floor(r() * 4) });
+      if (Math.abs(this.heading) < 0.1 && this.seg.type === 'straight')
+        this.pending.push({ s: node.s + 40, lat: lanes[Math.floor(r() * 3)], kind: 'power', idx: Math.floor(r() * 4) });
       this.nextPowerS = node.s + 2200 + r() * 1400;
     }
     this.flushPending();

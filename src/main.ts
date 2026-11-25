@@ -1,5 +1,5 @@
 import { AudioEngine } from './audio';
-import { BASE_SPEED, Car, InputController, LATERAL_GRIP, TOP_SPEED, autopilotSteer, followSteer } from './car';
+import { Car, InputController, LATERAL_GRIP, TOP_SPEED, autopilotSteer } from './car';
 import { CARS, carById, drawCar as drawCarModel, type CarModel } from './cars';
 import {
   PAINTS,
@@ -13,7 +13,6 @@ import {
   type Mission,
   type RunStats,
 } from './progress';
-import { TRAFFIC_PAINTS, TRAFFIC_STYLES } from './props';
 import { Renderer, type GhostPose } from './renderer';
 import {
   GHOST_INTERVAL,
@@ -27,7 +26,6 @@ import {
 } from './storage';
 import { BIOMES, Theme } from './theme';
 import { Track, ZONE_LENGTH, distToPolyline, type TrackQuery } from './track';
-import { Traffic, type TrafficCar } from './traffic';
 
 /**
  * TITLE → PLAYING → ENDING (time ran out, car eases off) → RESULTS → PLAYING …
@@ -37,23 +35,19 @@ type GameState = 'TITLE' | 'PLAYING' | 'ENDING' | 'RESULTS';
 
 // ───────────────────────── tuning ─────────────────────────
 
-const SECTOR_LENGTH = ZONE_LENGTH; // px → 1.5 km between checkpoints / world zones
-/** Grip while the player holds full steering (the tail lets go). */
-const DRIFT_GRIP = 3.8;
-/** Extra rotation a full hold adds on top of following the road (simulation-tuned). */
-const HOLD_GAIN = 0.3;
-/** Max steering the lane-keeping assist may use: enough for sweeps, not corners. */
-const ASSIST_MAX = 0.42;
+const SECTOR_LENGTH = ZONE_LENGTH; // px → 1 km per world zone
+/** Grip while steering hard: the tail lets go. */
+const DRIFT_GRIP = 3.6;
 /** Slip angle (deg) that counts as a drift. */
 const DRIFT_SLIP = 12;
-const START_TIME = 35;
-const MAX_TIME = 60;
-const OFFROAD_DRAIN = 0.6; // extra seconds per second off the asphalt
-const T_APEX = 0.8;
-const T_PERFECT = 1.6;
-const T_CHAIN = 1.5;
-const T_PAD = 0.4;
-const T_DRIFT = [0, 0.5, 1.2, 2.5];
+/** Heading snap on release: straightens small misalignments (deg). */
+const SNAP_DEG = 9;
+/** Wall contact starts here (car centre to road centre, px) … */
+const WALL_TOUCH = 58;
+/** … and beyond this the car is off the course: crash. */
+const WALL_CRASH = 80;
+const START_SPEED = 300;
+const ZONE_SPEED = 40;
 const PERFECT_DIST = 15;
 const APEX_DIST = 26;
 const CHAIN_LENGTH = 11;
@@ -64,10 +58,7 @@ const NITRO_MIN = 0.25;
 const DRIFT_TIERS = [0.5, 1.1, 1.8]; // seconds → GOOD / GREAT / INSANE
 const DRIFT_NAMES = ['', 'GOOD DRIFT', 'GREAT DRIFT', 'INSANE DRIFT'];
 const KMH = 0.6;
-const T_NEAR = 0.6;
-const T_CRASH = 3;
-const T_POWER = 5;
-const POWER_NAMES = ['MAGNET', 'SHIELD', '+5 SEC', '2× POINTS'];
+const POWER_NAMES = ['MAGNET', 'SHIELD', 'NITRO FILL', '2× POINTS'];
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -110,7 +101,6 @@ const progress = new Progress();
 const track = new Track((Math.random() * 2 ** 32) >>> 0);
 const car = new Car();
 const renderer = new Renderer(canvas, theme);
-const traffic = new Traffic({ styles: TRAFFIC_STYLES, paints: TRAFFIC_PAINTS });
 
 let model: CarModel = carById(progress.selected);
 let speedBonus = 0;
@@ -133,7 +123,7 @@ function applyModel(m: CarModel): void {
   renderer.setModel(m, paintById(progress.tune(m.id).paint)?.hex ?? null);
   speedBonus = (st.speed - 2) * 14;
   gripBonus = (st.handling - 2) * 0.35;
-  car.handling = (st.handling - 2) * 0.12;
+  car.minRadius = 122 - (st.handling - 2) * 5;
   nitroFactor = 0.8 + st.nitro * 0.12;
 }
 applyModel(model);
@@ -152,19 +142,19 @@ let startS = 0;
 let maxS = 0;
 let runTime = 0;
 let score = 0;
-let timeLeft = START_TIME;
+let combo = 1;
+let wallT = 0;
+let crashed = false;
+let nextCorner = 0;
 let sector = 0;
 let chainIdx = -1;
 let chainCount = 0;
 let boostT = 0;
 let glow = 0;
 let newBest = false;
-let lane = 0;
-let lastTick = 0;
 
 // Drift + nitro
 let drifting = false;
-let releaseT = 1;
 let driftChain = 0;
 let chainWindow = 0;
 let driftT = 0;
@@ -180,9 +170,6 @@ let nitroDur = 1;
 let magnetT = 0;
 let shieldT = 0;
 let doubleT = 0;
-let invulnT = 0;
-let nearCombo = 0;
-let nearComboT = 0;
 let slowT = 0;
 let timeScale = 1;
 let shownPowers = '';
@@ -239,12 +226,17 @@ function renderHud(): void {
       multEl.classList.add('bump');
     } else multEl.classList.remove('show');
   }
-  const t = Math.ceil(Math.max(0, timeLeft));
-  if (t !== shown.time) {
-    shown.time = t;
-    timeEl.textContent = String(t);
+  if (combo !== shown.time) {
+    const up = combo > shown.time && shown.time > 0;
+    shown.time = combo;
+    timeEl.textContent = `×${combo}`;
+    if (up) {
+      timerEl.classList.remove('pop');
+      void timerEl.offsetWidth;
+      timerEl.classList.add('pop');
+    }
   }
-  timerEl.classList.toggle('low', state === 'PLAYING' && timeLeft < 8);
+  timerEl.classList.toggle('low', state === 'PLAYING' && wallT > 0);
   cpFill.style.transform = `scaleX(${(((maxS - startS) % SECTOR_LENGTH) / SECTOR_LENGTH).toFixed(4)})`;
   const kmh = Math.round(car.speed * KMH);
   if (kmh !== shown.speed) {
@@ -534,7 +526,10 @@ function startRun(): void {
   runTime = 0;
   streak = 0;
   bonus = distPts = score = 0;
-  timeLeft = START_TIME;
+  combo = 1;
+  wallT = 0;
+  crashed = false;
+  nextCorner = 0;
   sector = 0;
   chainIdx = -1;
   chainCount = 0;
@@ -547,12 +542,9 @@ function startRun(): void {
   recording = [];
   sampleClock = 0;
   shown = { score: -1, mult: -1, time: -1, speed: -1, drift: '', nitro: -1 };
-  lane = q.lateral;
-  magnetT = shieldT = doubleT = invulnT = 0;
-  nearCombo = 0;
+  magnetT = shieldT = doubleT = 0;
   track.setZoneOrigin(q.s, q.s + 160);
   for (const u of track.powerups) if (u.s < q.s + 160) u.taken = true;
-  traffic.start(q.s);
   for (const ap of track.apexes) if (ap.s < q.s + 30) ap.passed = true;
   for (const o of track.orbs) if (o.s < q.s + 30) o.taken = true;
   input.consumeActive();
@@ -574,12 +566,11 @@ function startRun(): void {
 
 function endRun(): void {
   setState('ENDING');
-  traffic.stop();
   endDrift(false);
   nitroT = 0;
   streak = 0;
   hideDrift();
-  banner('TIME UP');
+  banner('CRASHED', `${fmt(score)} PTS`);
   audio.fadeOut();
   navigator.vibrate?.([20, 60, 20]);
   if (newBest) {
@@ -590,8 +581,6 @@ function endRun(): void {
 
 function showResults(): void {
   setState('RESULTS');
-  traffic.stop();
-  traffic.cars.length = 0;
   run.score = score;
   const levelBefore = progress.level;
   const missionsThisRun = progress.missions.map((m) => ({ ...m }));
@@ -600,11 +589,11 @@ function showResults(): void {
   const dist = Math.floor((maxS - startS) / 10);
   const earned = run.coins + missionCoins + res.levelCoins;
   resultsEl.innerHTML = `
-    <div class="r-label">${newBest ? '<span class="r-best">NEW BEST</span>' : `SECTOR ${run.sector}`}</div>
+    <div class="r-label">${newBest ? '<span class="r-best">NEW BEST</span>' : `ZONE ${run.sector}`}</div>
     <div class="r-score">${fmt(score)}</div>
     <div class="r-stats">
       <div><b>${fmt(dist)}</b><span>meters</span></div>
-      <div><b>${run.streak}x</b><span>best flow</span></div>
+      <div><b>×${run.streak}</b><span>best combo</span></div>
       <div><b>${run.perfects}</b><span>perfect</span></div>
       <div><b>${fmt(run.bestDrift)}</b><span>best drift</span></div>
     </div>
@@ -680,11 +669,7 @@ function breakStreak(): void {
 }
 
 function addScore(pts: number): void {
-  bonus += pts * (nitroT > 0 ? 2 : 1) * (doubleT > 0 ? 2 : 1);
-}
-
-function addTime(t: number): void {
-  timeLeft = Math.min(MAX_TIME, timeLeft + t);
+  bonus += pts * combo * (nitroT > 0 ? 2 : 1) * (doubleT > 0 ? 2 : 1);
 }
 
 function addCoins(n: number): void {
@@ -740,7 +725,6 @@ function collectApex(ap: (typeof track.apexes)[number]): void {
   run.streak = Math.max(run.streak, streak);
   const pts = 100 * streak * (perfect ? 2 : 1);
   addScore(pts);
-  addTime(perfect ? T_PERFECT : T_APEX);
   car.boost(perfect ? 40 : 25);
   renderer.spawnRipple(ap.mx, ap.my, perfect);
   renderer.popup(ap.mx, ap.my - 10, perfect ? `PERFECT +${fmt(pts)}` : `+${fmt(pts)}`, perfect, perfect ? 15 : 13);
@@ -803,7 +787,6 @@ function updateOrbs(dt: number, playing: boolean): void {
       if (chainCount === CHAIN_LENGTH) {
         const pts = 250 * Math.max(1, streak);
         addScore(pts);
-        addTime(T_CHAIN);
         addCoins(5);
         run.chains++;
         renderer.popup(car.x, car.y - 30, `CHAIN +${fmt(pts)}  ${COIN}5`, true, 14);
@@ -826,7 +809,6 @@ function updatePads(playing: boolean): void {
       pad.used = true;
       boostT = BOOST_TIME;
       car.boost(110);
-      addTime(T_PAD);
       addScore(50 * Math.max(1, streak));
       nitro = Math.min(1, nitro + 0.08 * nitroFactor);
       renderer.kick(0.5);
@@ -846,7 +828,6 @@ function endDrift(clean: boolean): void {
     if (clean) {
       const pts = Math.floor(driftPts);
       addScore(pts);
-      addTime(T_DRIFT[driftTier]);
       run.bestDrift = Math.max(run.bestDrift, pts);
       if (driftTier === 3) run.insane++;
       chainWindow = 1.3;
@@ -899,83 +880,92 @@ function updateDrift(dt: number, onRoad: boolean): void {
   if (tier > 0) showDrift(`${DRIFT_NAMES[tier]}${driftChain > 0 ? ` ×${driftChain + 1}` : ''} ${fmt(driftPts)}`, true);
 }
 
-// ── Traffic: close calls, crashes, nitro takedowns ──
+// ── Course: walls, crashes and corner grading ──
 
 function slowMo(seconds: number): void {
   slowT = Math.max(slowT, seconds);
 }
 
-function takedown(c: TrafficCar, dl: number, label: string): void {
-  traffic.wreck(c, car.vx, car.vy, dl >= 0 ? 1 : -1);
-  run.takedowns++;
-  const pts = 300 * Math.max(1, streak);
-  addScore(pts);
-  addTime(1);
-  renderer.spawnSparks((c.x + car.x) / 2, (c.y + car.y) / 2, car.vx, car.vy, 26);
-  renderer.kick(0.8);
-  renderer.popup(c.x, c.y - 24, `${label} +${fmt(pts)}`, true, 16);
-  audio.takedown();
-  slowMo(0.22);
-  navigator.vibrate?.([30, 30, 40]);
-}
-
-let crashCount = 0;
-function crash(c: TrafficCar, dl: number): void {
-  crashCount++;
-  invulnT = 1.3;
-  car.vx *= 0.42;
-  car.vy *= 0.42;
-  driftAngle += (dl >= 0 ? -1 : 1) * 0.9;
-  timeLeft = Math.max(0.5, timeLeft - T_CRASH);
-  breakStreak();
-  endDrift(false);
-  nearCombo = 0;
-  c.v *= 0.75;
-  c.lat += (dl >= 0 ? 1 : -1) * 10;
-  c.brake = 1;
-  lane = q.lateral - (dl >= 0 ? 1 : -1) * 8;
-  renderer.spawnSparks((c.x + car.x) / 2, (c.y + car.y) / 2, car.vx, car.vy, 18);
+/** Leaving the course ends the run — unless a shield bounces you back. */
+function crashOut(): void {
+  const p = track.poseAt(q.s);
+  if (shieldT > 0 && p) {
+    shieldT = 0;
+    const side = Math.sign(q.lateral);
+    const back = side * (WALL_TOUCH - 14);
+    car.x = p.x + p.nx * back;
+    car.y = p.y + p.ny * back;
+    car.angle = p.angle;
+    const v = car.speed * 0.7;
+    car.vx = Math.cos(p.angle) * v;
+    car.vy = Math.sin(p.angle) * v;
+    renderer.spawnSparks(car.x, car.y, 0, 0, 20);
+    renderer.kick(0.6);
+    renderer.popup(car.x, car.y - 26, 'SHIELD SAVE', true, 15);
+    audio.crash();
+    navigator.vibrate?.(40);
+    combo = 1;
+    return;
+  }
+  crashed = true;
+  run.score = score;
+  driftAngle = (Math.random() < 0.5 ? -1 : 1) * 1.4;
+  renderer.spawnSparks(car.x, car.y, car.vx, car.vy, 34);
   renderer.kick(1);
-  renderer.popup(car.x, car.y - 30, `CRASH −${T_CRASH}s`, true, 15);
+  slowMo(0.5);
   audio.crash();
-  navigator.vibrate?.(70);
+  navigator.vibrate?.([60, 40, 80]);
+  endRun();
 }
 
-function nearMiss(c: TrafficCar): void {
-  nearCombo = nearComboT > 0 ? nearCombo + 1 : 1;
-  nearComboT = 3;
-  run.nearMisses++;
-  const pts = 150 * nearCombo * Math.max(1, streak);
-  addScore(pts);
-  addTime(T_NEAR);
-  nitro = Math.min(1, nitro + 0.05 * nitroFactor);
-  renderer.popup(c.x, c.y - 22, nearCombo > 1 ? `CLOSE ×${nearCombo} +${fmt(pts)}` : `CLOSE CALL +${fmt(pts)}`, nearCombo > 1, 13);
-  renderer.kick(0.12);
-  audio.nearMiss();
-  navigator.vibrate?.(6);
+/** Grades each corner once the car has left it. */
+function gradeCorner(slipPeak: number, touched: boolean): void {
+  const p = track.poseAt(q.s);
+  const velAngle = Math.atan2(car.vy, car.vx);
+  const exitErr = p ? Math.abs(wrapAngle(velAngle - p.angle)) * (180 / Math.PI) : 90;
+  let label: string;
+  let pts: number;
+  if (touched) {
+    label = 'SLOPPY';
+    pts = 0;
+    combo = 1;
+  } else if (slipPeak > DRIFT_SLIP && exitErr < 7) {
+    label = 'PERFECT CORNER';
+    pts = 400;
+    combo = Math.min(9, combo + 1);
+    run.perfects++;
+    nitro = Math.min(1, nitro + 0.15 * nitroFactor);
+    renderer.kick(0.25);
+    audio.chime(combo + 2);
+    navigator.vibrate?.([8, 30, 12]);
+  } else {
+    label = 'CLEAN';
+    pts = 200;
+    combo = Math.min(9, combo + 1);
+    audio.blip(combo, 0.05);
+  }
+  run.streak = Math.max(run.streak, combo);
+  if (pts) addScore(pts);
+  renderer.popup(car.x, car.y - 30, pts ? `${label} +${fmt(pts * combo)}` : label, label !== 'CLEAN', label === 'SLOPPY' ? 12 : 14);
 }
 
-function updateTrafficPlay(): void {
-  for (const c of traffic.cars) {
-    if (c.wreck || c.resolved) continue;
-    const d = traffic.dims(c);
-    const ds = c.s - q.s;
-    const dl = c.lat - q.lateral;
-    const longR = d.length / 2 + 19;
-    const latR = d.width / 2 + 9;
-    if (Math.abs(ds) < longR) c.minGap = Math.min(c.minGap, Math.abs(dl) - latR);
-    if (Math.abs(ds) < longR - 3 && Math.abs(dl) < latR - 2) {
-      c.resolved = true;
-      if (nitroT > 0) takedown(c, dl, 'TAKEDOWN');
-      else if (shieldT > 0) {
-        shieldT = 0;
-        takedown(c, dl, 'SHIELD SMASH');
-      } else if (invulnT <= 0) crash(c, dl);
-      continue;
+let cornerPeak = 0;
+let cornerTouched = false;
+
+function updateCorners(slipDeg: number): void {
+  const list = track.corners;
+  for (const c of list) {
+    if (c.s1 + 50 < startS) continue;
+    if (c.s0 > q.s + 10) break;
+    if (q.s >= c.s0 - 30 && q.s <= c.s1 + 50) {
+      cornerPeak = Math.max(cornerPeak, slipDeg);
+      if (wallT > 0) cornerTouched = true;
     }
-    if (ds < -longR) {
-      c.resolved = true;
-      if (c.minGap < 16) nearMiss(c);
+    if (q.s > c.s1 + 50 && c.s1 > nextCorner) {
+      nextCorner = c.s1;
+      gradeCorner(cornerPeak, cornerTouched);
+      cornerPeak = 0;
+      cornerTouched = false;
     }
   }
 }
@@ -991,7 +981,7 @@ function updatePowerups(): void {
       u.age = 0;
       if (u.kind === 0) magnetT = 8;
       else if (u.kind === 1) shieldT = 15;
-      else if (u.kind === 2) addTime(T_POWER);
+      else if (u.kind === 2) nitro = 1;
       else doubleT = 8;
       renderer.popup(u.x, u.y - 20, POWER_NAMES[u.kind], true, 14);
       renderer.spawnRipple(u.x, u.y);
@@ -1027,31 +1017,11 @@ if (import.meta.env.DEV) {
       Car,
       Track,
       progress,
-      traffic,
       get state() {
-        return {
-          state,
-          streak,
-          score,
-          bestScore,
-          timeLeft,
-          sector,
-          lane,
-          nitro,
-          drifting,
-          driftTier,
-          run,
-          shieldT,
-          magnetT,
-          crashes: crashCount,
-          samples: recording.length / 3,
-        };
+        return { state, combo, score, bestScore, sector, nitro, drifting, driftTier, run, wallT, crashed, samples: recording.length / 3 };
       },
       autopilot(on: boolean) {
         debugAutopilot = on;
-      },
-      setTime(v: number) {
-        timeLeft = v;
       },
       fireNitro,
     },
@@ -1079,12 +1049,11 @@ function step(now: number): void {
   const playing = state === 'PLAYING';
 
   track.update(q.s);
-  const onRoadBefore = Math.abs(q.lateral) <= track.halfWidth;
 
+  // ── Steering ──
   let steer: number;
   if (!playing || debugAutopilot) {
     steer = autopilotSteer(car, track, q);
-    lane = q.lateral;
     car.grip = LATERAL_GRIP;
   } else {
     let cmd = input.steer;
@@ -1092,56 +1061,51 @@ function step(now: number): void {
       const bot = (window as { __botSteer?: () => number }).__botSteer;
       if (bot) cmd = bot();
     }
-    const holdLimit = track.halfWidth - 14;
-    if (Math.abs(cmd) > 0.04) {
-      // Holding: the car follows the road's curvature and the hold adds extra
-      // rotation — the tail steps out. Too long pulls you inside, too short
-      // and the corner pushes you wide.
-      const ff = (track.curvatureAt(q.s + car.speed * 0.1) * car.speed) / car.turnRate;
-      if (ff * cmd > 0) steer = Math.max(-1, Math.min(1, ff + cmd * HOLD_GAIN));
-      // On straights a hold is a lane change, so it steers gently.
-      else steer = cmd * (Math.abs(ff) < 0.15 ? 0.45 : 1);
-      const g = LATERAL_GRIP + gripBonus;
-      const target = g + (DRIFT_GRIP + gripBonus * 0.4 - g) * Math.min(1, Math.abs(cmd));
-      car.grip += (target - car.grip) * Math.min(1, dt * 10);
-      releaseT = 0;
-      lane = Math.max(-holdLimit, Math.min(holdLimit, q.lateral));
-    } else {
-      // Hands off: catch the slide, then keep the current line. The assist is
-      // only strong enough for sweeps; real corners need a drift.
-      releaseT += dt;
-      car.grip += (LATERAL_GRIP + gripBonus - car.grip) * Math.min(1, dt * 5);
-      if (releaseT < 0.12) lane = Math.max(-holdLimit, Math.min(holdLimit, q.lateral));
-      const authority = releaseT < 0.35 ? 0.8 : ASSIST_MAX;
-      steer = Math.max(-authority, Math.min(authority, followSteer(car, track, q, lane)));
+    if (crashed) cmd = 0;
+    // Direct control: what you hold is what the car does. Holding at speed
+    // breaks the rear loose; letting go grips up and drives straight.
+    steer = cmd;
+    const g = LATERAL_GRIP + gripBonus;
+    const target = Math.abs(cmd) > 0.05 ? g + (DRIFT_GRIP + gripBonus * 0.4 - g) * Math.min(1, Math.abs(cmd)) : g;
+    car.grip += (target - car.grip) * Math.min(1, dt * (Math.abs(cmd) > 0.05 ? 12 : 5));
+    if (Math.abs(cmd) <= 0.05) {
+      // Small heading snap on release so a nearly-straight exit becomes straight.
+      const p = track.poseAt(q.s + 40);
+      if (p) {
+        const err = wrapAngle(p.angle - car.angle);
+        if (Math.abs(err) < (SNAP_DEG * Math.PI) / 180) car.angle += err * Math.min(1, dt * 6);
+      }
     }
   }
 
+  // ── Speed ──
   boostT = Math.max(0, boostT - dt);
   nitroT = Math.max(0, nitroT - dt);
   const boostAmt = boostT / BOOST_TIME;
   const nitroAmt = nitroT > 0 ? Math.min(1, nitroT / 0.4, 0.6 + 0.4 * (nitroT / nitroDur)) : 0;
   let target: number;
-  if (state === 'ENDING' || state === 'RESULTS') target = 150;
+  if (state === 'ENDING') target = 0;
+  else if (state === 'RESULTS') target = 150;
   else if (state === 'TITLE') target = 230;
   else
     target =
-      Math.min(TOP_SPEED + speedBonus, BASE_SPEED + speedBonus + streak * 12 + sector * 22) +
+      Math.min(TOP_SPEED + speedBonus, START_SPEED + speedBonus + sector * ZONE_SPEED + combo * 4) +
       BOOST_SPEED * boostAmt +
       (nitroT > 0 ? NITRO_SPEED : 0);
-  if (drifting) target *= 1 - 0.15 * Math.min(1, Math.abs(car.vLateral) / Math.max(1, car.speed) / 0.6);
-  if (!onRoadBefore) target *= 0.72;
+  if (drifting) target *= 1 - 0.12 * Math.min(1, Math.abs(car.vLateral) / Math.max(1, car.speed) / 0.6);
+  if (wallT > 0) target *= 0.8;
   car.update(dt, steer, target);
+  if (state === 'ENDING') car.angle += driftAngle * dt * 6;
 
   q = track.nearest(car.x, car.y);
-  const onRoad = Math.abs(q.lateral) <= track.halfWidth;
+  const lat = Math.abs(q.lateral);
+  const slipDeg = (Math.abs(Math.atan2(car.vLateral, Math.max(1, car.vForward))) * 180) / Math.PI;
 
-  // Soft cushion: off the asphalt, a gentle pull grows with distance.
-  if (!onRoad) {
+  // Off-course outside of a run: keep the demo car on the road.
+  if (!playing && lat > WALL_TOUCH) {
     const p = track.poseAt(q.s);
     if (p) {
-      const excess = Math.abs(q.lateral) - track.halfWidth;
-      const pull = Math.min(60 + excess * 2.4, 320) * dt * Math.sign(q.lateral);
+      const pull = Math.min(60 + (lat - WALL_TOUCH) * 3, 320) * dt * Math.sign(q.lateral);
       car.vx -= p.nx * pull;
       car.vy -= p.ny * pull;
     }
@@ -1150,16 +1114,10 @@ function step(now: number): void {
   updateApexes(dt, playing);
   updateOrbs(dt, playing);
   updatePads(playing);
-  traffic.update(dt, track, q.s, sector);
-  if (playing) {
-    updateTrafficPlay();
-    updatePowerups();
-  }
+  if (playing) updatePowerups();
   magnetT = Math.max(0, magnetT - dt);
   shieldT = Math.max(0, shieldT - dt);
   doubleT = Math.max(0, doubleT - dt);
-  invulnT = Math.max(0, invulnT - dt);
-  nearComboT = Math.max(0, nearComboT - dt);
   for (const u of track.powerups) if (u.taken && u.age >= 0) u.age += dt;
 
   // World zone follows the road position (title + runs).
@@ -1171,90 +1129,97 @@ function step(now: number): void {
 
   if (playing) {
     runTime += dt;
-    if (!onRoad) breakStreak();
-    updateDrift(dt, onRoad);
 
-    if (q.s > maxS) {
-      distPts += ((q.s - maxS) / 10) * (nitroT > 0 ? 2 : 1);
-      maxS = q.s;
-    }
-
-    const nextSector = Math.floor((maxS - startS) / SECTOR_LENGTH);
-    if (nextSector > sector) {
-      sector = nextSector;
-      run.sector = sector + 1;
-      const extra = Math.max(10, 22 - 2 * sector);
-      addTime(extra);
-      addScore(1000 * sector);
-      addCoins(10 * sector);
-      banner('CHECKPOINT', `+${extra}s · ${BIOMES[track.zoneAt(q.s + 200)].name}`);
-      audio.chord();
-      navigator.vibrate?.([12, 50, 12]);
-    }
-
-    timeLeft -= (1 + sector * 0.08 + (onRoad ? 0 : OFFROAD_DRAIN)) * dt;
-    if (timeLeft < 5.5 && Math.ceil(timeLeft) !== lastTick && timeLeft > 0) {
-      lastTick = Math.ceil(timeLeft);
-      audio.blip(-5, 0.05);
-    }
-    score = Math.floor(distPts + bonus);
-    run.score = score;
-    run.topKmh = Math.max(run.topKmh, Math.round(car.speed * KMH));
-    recordGhost(dt);
-    if (score > bestScore) {
-      if (!newBest && bestScore > 0) {
-        renderer.popup(car.x, car.y - 40, 'NEW BEST', true, 13);
-        audio.blip(9, 0.06);
+    // Walls: scraping costs the combo, leaving the course ends the run.
+    if (lat > WALL_CRASH) crashOut();
+    else if (lat > WALL_TOUCH) {
+      if (wallT <= 0) {
+        combo = 1;
+        renderer.popup(car.x, car.y - 24, 'WALL', false, 12);
+        audio.crash();
+        navigator.vibrate?.(20);
       }
-      newBest = true;
-      bestScore = score;
-      dirtyBest = true;
+      wallT = 0.25;
+      if (Math.random() < 0.6) renderer.spawnSparks(car.x, car.y, car.vx * 0.3, car.vy * 0.3, 2);
+      // Lean the car back off the barrier.
+      const p = track.poseAt(q.s);
+      if (p) {
+        const push = (lat - WALL_TOUCH) * 9 * dt * Math.sign(q.lateral);
+        car.vx -= p.nx * push;
+        car.vy -= p.ny * push;
+      }
     }
-    persistBest();
-    if (Math.floor(runTime * 4) !== Math.floor((runTime - dt) * 4)) {
-      for (const m of progress.checkMissions(run)) {
-        banner('MISSION COMPLETE', `${m.text} · ${COIN} ${m.reward}`);
+    wallT = Math.max(0, wallT - dt);
+
+    if (state === 'PLAYING') {
+      updateDrift(dt, lat <= WALL_TOUCH);
+      updateCorners(slipDeg);
+      if (q.s > maxS) {
+        distPts += ((q.s - maxS) / 10) * (nitroT > 0 ? 2 : 1);
+        maxS = q.s;
+      }
+      const nextSector = Math.floor((maxS - startS) / SECTOR_LENGTH);
+      if (nextSector > sector) {
+        sector = nextSector;
+        run.sector = sector + 1;
+        addScore(500 * sector);
+        addCoins(10 * sector);
+        banner(`ZONE ${sector + 1}`, BIOMES[track.zoneAt(q.s + 200)].name);
         audio.chord();
-        navigator.vibrate?.([10, 30, 10]);
+        navigator.vibrate?.([12, 50, 12]);
+      }
+      score = Math.floor(distPts + bonus);
+      run.score = score;
+      run.topKmh = Math.max(run.topKmh, Math.round(car.speed * KMH));
+      recordGhost(dt);
+      if (score > bestScore) {
+        if (!newBest && bestScore > 0) {
+          renderer.popup(car.x, car.y - 40, 'NEW BEST', true, 13);
+          audio.blip(9, 0.06);
+        }
+        newBest = true;
+        bestScore = score;
+        dirtyBest = true;
+      }
+      persistBest();
+      if (Math.floor(runTime * 4) !== Math.floor((runTime - dt) * 4)) {
+        for (const m of progress.checkMissions(run)) {
+          banner('MISSION COMPLETE', `${m.text} · ${COIN} ${m.reward}`);
+          audio.chord();
+          navigator.vibrate?.([10, 30, 10]);
+        }
       }
     }
-    if (timeLeft <= 0) {
-      timeLeft = 0;
-      endRun();
-    }
-  } else if (state === 'ENDING' && stateTime > 1.6) {
+  } else if (state === 'ENDING' && stateTime > 1.3) {
     showResults();
   }
 
-  // Drift visuals: tail swings out toward the outside of the bend.
-  const driftTarget = 0;
-  driftAngle += (driftTarget - driftAngle) * (1 - Math.exp(-7 * dt));
+  // Crash spin decays.
+  driftAngle *= Math.exp(-3 * dt);
 
   // Effects
+  const onRoad = lat <= WALL_TOUCH + 6;
   const slip = Math.abs(car.vLateral);
-  const visualSlip = slip + Math.abs(driftAngle) * 140;
-  renderer.addTrail(car, onRoad && visualSlip > 24, time, driftAngle);
-  const slipDegFx = (Math.abs(Math.atan2(car.vLateral, Math.max(1, car.vForward))) * 180) / Math.PI;
-  if (onRoad && (slipDegFx > 13 || Math.abs(driftAngle) > 0.15)) renderer.spawnSmoke(car, driftAngle, Math.min(1, slipDegFx / 30 + Math.abs(driftAngle)));
+  renderer.addTrail(car, onRoad && slip > 24, time, 0);
+  if (onRoad && slipDeg > 13) renderer.spawnSmoke(car, 0, Math.min(1, slipDeg / 30));
   if (!onRoad && car.speed > 60) renderer.spawnDust(car);
-  glow += ((visualSlip > 28 || boostAmt > 0.1 || nitroT > 0 ? 1 : 0) - glow) * (1 - Math.exp(-8 * dt));
+  glow += ((slip > 28 || boostAmt > 0.1 || nitroT > 0 ? 1 : 0) - glow) * (1 - Math.exp(-8 * dt));
   renderer.updateEffects(dt, time);
-  renderer.updateCamera(dt, car, Math.max(boostAmt, nitroAmt));
+  renderer.updateCamera(dt, car, Math.max(boostAmt, nitroAmt), track, q.s);
   theme.update(dt);
 
-  const speedNorm = Math.min(1, Math.max(0, (car.speed - BASE_SPEED * 0.7) / (TOP_SPEED - BASE_SPEED * 0.7)));
-  audio.update(speedNorm, visualSlip, onRoad);
+  const speedNorm = Math.min(1, Math.max(0, (car.speed - 200) / (TOP_SPEED - 200)));
+  audio.update(speedNorm, slip, onRoad);
   audio.engine(car.speed, state !== 'TITLE', nitroT > 0);
 
   renderer.render(car, track, ghostPose(), glow, {
     boost: boostAmt,
     time,
     nitro: nitroAmt,
-    drift: driftAngle,
+    drift: 0,
     night: theme.night,
     shield: Math.min(1, shieldT),
     magnet: magnetT > 0,
-    traffic: traffic.cars,
   });
   if (state !== 'TITLE') {
     renderHud();

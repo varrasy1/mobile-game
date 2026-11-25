@@ -26,8 +26,6 @@ export class Car {
   steer = 0;
   vForward = BASE_SPEED;
   vLateral = 0;
-  /** Extra turn authority from the selected car's handling stat (rad/s). */
-  handling = 0;
   /** Lateral grip (1/s). Lowered while the player holds a drift. */
   grip = LATERAL_GRIP;
 
@@ -35,9 +33,11 @@ export class Car {
     return Math.hypot(this.vx, this.vy);
   }
 
+  /** Tightest drift radius (px): the same at every speed, so corners are about timing. */
+  minRadius = 122;
+
   get turnRate(): number {
-    const hi = Math.min(1, Math.max(0, (this.speed - BASE_SPEED) / (TOP_SPEED - BASE_SPEED)));
-    return 2.85 + this.handling - 0.1 * hi; // slightly gentler at top speed, still enough for the tightest bend
+    return Math.max(1.6, this.speed / this.minRadius);
   }
 
   update(dt: number, steerInput: number, targetSpeed: number): void {

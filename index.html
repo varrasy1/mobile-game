@@ -427,7 +427,9 @@
       }
       #timer.low #time {
         color: var(--accent);
-        animation: lowpulse 0.5s ease-in-out infinite;
+      }
+      #timer.pop #time {
+        animation: bump 260ms var(--ease);
       }
       .cp {
         width: 74px;
@@ -994,7 +996,7 @@
     <div id="drift" class="center-note"></div>
     <div id="banner" class="center-note"></div>
     <div id="hint" class="center-note">
-      Hold into a corner to drift · release to straighten<br />Tap to switch lanes · nitro smashes through traffic
+      Hold left / right to drift through corners<br />Release when the nose points down the next straight
     </div>
     <div id="results" aria-live="polite"></div>
 
@@ -1005,9 +1007,9 @@
         <div id="powers"></div>
       </div>
       <div id="timer">
-        <div id="time">30</div>
+        <div id="time">×1</div>
         <div class="cp"><div id="cp-fill"></div></div>
-        <div class="cp-label">CHECKPOINT</div>
+        <div class="cp-label">COMBO · NEXT ZONE</div>
       </div>
       <div id="speed">0<small>km/h</small></div>
       <button id="nitro" type="button" aria-label="Fire nitro">

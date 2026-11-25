@@ -1,7 +1,6 @@
 import { BASE_SPEED, MAX_SPEED, TOP_SPEED, type Car } from './car';
 import { CARS, drawCar as drawCarModel, type CarModel } from './cars';
-import { drawHeadlights, drawProp, drawPropLight, drawTraffic, drawTrafficLights, type PropDrawOptions } from './props';
-import type { TrafficCar } from './traffic';
+import { drawHeadlights, drawProp, drawPropLight, type PropDrawOptions } from './props';
 import { css, type Palette, type Theme } from './theme';
 import { NODE_SPACING, type Track } from './track';
 
@@ -78,8 +77,7 @@ export interface FrameFx {
   shield: number;
   /** Magnet active (pulse ring). */
   magnet: boolean;
-  /** Traffic to draw. */
-  traffic: readonly TrafficCar[];
+
 }
 
 type View = { l: number; r: number; t: number; b: number };
@@ -97,6 +95,10 @@ export class Renderer {
   private cvx = 0;
   private cvy = 0;
   private zoom = 1.04;
+  /** Camera rotation (radians) and screen anchor of the camera point. */
+  private rot = 0;
+  private ax = 0;
+  private ay = 0;
   private cameraReady = false;
 
   private grain: CanvasPattern | null = null;
@@ -199,19 +201,25 @@ export class Renderer {
 
   // ───────────────────────── camera ─────────────────────────
 
-  updateCamera(dt: number, car: Car, boost: number): void {
-    const tx = car.x + car.vx * 0.32;
-    const ty = car.y + car.vy * 0.32;
+  /** Track-up chase camera: the road ahead always points up the screen. */
+  updateCamera(dt: number, car: Car, boost: number, track: Track, s: number): void {
+    const p = track.poseAt(s + 50) ?? track.poseAt(s);
+    const roadAngle = p ? p.angle : Math.atan2(car.vy, car.vx);
+    const look = 70 + car.speed * 0.16;
+    const tx = car.x + Math.cos(roadAngle) * look;
+    const ty = car.y + Math.sin(roadAngle) * look;
     const speed = car.speed;
     const base = Math.min(1.04, Math.max(0.88, 1.04 - ((speed - BASE_SPEED) / (MAX_SPEED - BASE_SPEED)) * 0.14));
     const beyond = Math.max(0, Math.min(1, (speed - MAX_SPEED) / (TOP_SPEED - MAX_SPEED)));
     const targetZoom = base - beyond * 0.08 - boost * 0.05;
+    const targetRot = -Math.PI / 2 - roadAngle;
     this.shake = Math.max(0, this.shake - dt * 3);
 
     if (!this.cameraReady) {
       this.cx = tx;
       this.cy = ty;
       this.zoom = targetZoom;
+      this.rot = targetRot;
       this.cameraReady = true;
     }
     // Critically damped spring.
@@ -220,9 +228,21 @@ export class Renderer {
     this.cvy += (w * w * (ty - this.cy) - 2 * w * this.cvy) * dt;
     this.cx += this.cvx * dt;
     this.cy += this.cvy * dt;
+    const dr = Math.atan2(Math.sin(targetRot - this.rot), Math.cos(targetRot - this.rot));
+    this.rot += dr * Math.min(1, dt * 3.2);
     this.zoom += (targetZoom - this.zoom) * (1 - Math.exp(-2 * dt));
     this.scale = (Math.min(this.vw, 520) / 390) * this.zoom;
   }
+
+  /** World → CSS-pixel screen position (for overlays). */
+  private toScreen(x: number, y: number): [number, number] {
+    const dx = x - this.cx;
+    const dy = y - this.cy;
+    const c = Math.cos(this.rot);
+    const sn = Math.sin(this.rot);
+    return [this.ax + (dx * c - dy * sn) * this.scale, this.ay + (dx * sn + dy * c) * this.scale];
+  }
+
 
   // ───────────────────────── effects ─────────────────────────
 
@@ -370,17 +390,17 @@ export class Renderer {
 
     // World transform: camera centre sits slightly below screen centre.
     const sh = this.shake * this.shake * 5;
-    const ox = vw * 0.5 - this.cx * s + (sh ? (Math.random() - 0.5) * sh : 0);
-    const oy = vh * 0.55 - this.cy * s + (sh ? (Math.random() - 0.5) * sh : 0);
-    ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+    this.ax = vw * 0.5 + (sh ? (Math.random() - 0.5) * sh : 0);
+    this.ay = vh * 0.5 + (sh ? (Math.random() - 0.5) * sh : 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.translate(this.ax, this.ay);
+    ctx.rotate(this.rot);
+    ctx.scale(s, s);
+    ctx.translate(-this.cx, -this.cy);
 
-    const pad = 120;
-    const view = {
-      l: -ox / s - pad,
-      r: (vw - ox) / s + pad,
-      t: -oy / s - pad,
-      b: (vh - oy) / s + pad,
-    };
+    // Rotated view: cull against a square that covers the whole screen.
+    const half = Math.hypot(vw, vh) / 2 / s + 120;
+    const view = { l: this.cx - half, r: this.cx + half, t: this.cy - half, b: this.cy + half };
 
     const popts: PropDrawOptions = { pal, night: fx.night, time: fx.time, pxScale: dpr * s };
     this.drawProps(track, popts, view);
@@ -391,7 +411,6 @@ export class Renderer {
     this.drawApexes(track, pal, view);
     this.drawOrbs(track, pal, view, fx.time);
     this.drawPowerups(track, pal, view, fx.time);
-    this.drawTrafficCars(fx.traffic, popts, view);
     this.drawRipples(pal);
     if (ghost && ghost.alpha > 0.002) this.drawGhost(ghost, pal, fx);
     this.drawCar(car, pal, glow, fx);
@@ -402,7 +421,7 @@ export class Renderer {
 
     this.drawSparks(pal);
     this.drawStreaks(car, pal, view, Math.max(fx.boost, fx.nitro));
-    this.drawPopups(pal, ox, oy);
+    this.drawPopups(pal);
 
     // Vignette
     if (this.vignette) {
@@ -416,9 +435,6 @@ export class Renderer {
     // Grain, anchored to the world so it reads as asphalt/paper texture.
     if (this.grain) {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      const gx = (((ox * dpr) % 128) + 128) % 128;
-      const gy = (((oy * dpr) % 128) + 128) % 128;
-      this.grain.setTransform(new DOMMatrix([1, 0, 0, 1, gx, gy]));
       ctx.fillStyle = this.grain;
       ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     }
@@ -430,19 +446,6 @@ export class Renderer {
       const m = p.r + 40;
       if (p.x < v.l - m || p.x > v.r + m || p.y < v.t - m || p.y > v.b + m) continue;
       drawProp(ctx, p.kind, p.x, p.y, p.r, p.seed, o, p.angle);
-    }
-  }
-
-  private drawTrafficCars(cars: readonly TrafficCar[], o: PropDrawOptions, v: View): void {
-    const { ctx } = this;
-    for (const c of cars) {
-      if (c.x < v.l - 60 || c.x > v.r + 60 || c.y < v.t - 60 || c.y > v.b + 60) continue;
-      ctx.save();
-      ctx.translate(c.x, c.y);
-      ctx.rotate(c.angle + Math.PI / 2);
-      if (c.wreck) ctx.globalAlpha = Math.max(0, 1 - Math.max(0, c.wreckT - 1.6));
-      drawTraffic(ctx, c.style, { ...o, paint: c.paint, brake: c.brake, indicator: c.indicator, ghost: c.wreck });
-      ctx.restore();
     }
   }
 
@@ -565,14 +568,6 @@ export class Renderer {
       if (p.x < v.l - 80 || p.x > v.r + 80 || p.y < v.t - 80 || p.y > v.b + 80) continue;
       drawPropLight(ctx, p.kind, p.x, p.y, p.r, p.seed, o, p.angle);
     }
-    for (const c of fx.traffic) {
-      if (c.wreck || c.x < v.l - 160 || c.x > v.r + 160 || c.y < v.t - 160 || c.y > v.b + 160) continue;
-      ctx.save();
-      ctx.translate(c.x, c.y);
-      ctx.rotate(c.angle + Math.PI / 2);
-      drawTrafficLights(ctx, c.style, { ...o, paint: c.paint, brake: c.brake, indicator: c.indicator });
-      ctx.restore();
-    }
     // Orbs and apex arcs glow in the dark.
     const sprite = this.glowSprite(pal);
     for (const orb of track.orbs) {
@@ -672,10 +667,9 @@ export class Renderer {
     ctx.globalAlpha = 1;
   }
 
-  private drawPopups(pal: Palette, ox: number, oy: number): void {
+  private drawPopups(pal: Palette): void {
     if (!this.popups.length) return;
     const { ctx, dpr } = this;
-    const s = this.scale;
     ctx.save();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textAlign = 'center';
@@ -687,7 +681,8 @@ export class Renderer {
       ctx.globalAlpha = t < 0.7 ? 1 : 1 - (t - 0.7) / 0.3;
       ctx.font = `600 ${(p.size * pop).toFixed(1)}px -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif`;
       ctx.fillStyle = p.accent ? css(pal.accent) : css(pal.edge, 0.9);
-      ctx.fillText(p.text, p.x * s + ox, p.y * s + oy - rise);
+      const [sx, sy] = this.toScreen(p.x, p.y);
+      ctx.fillText(p.text, sx, sy - rise);
     }
     ctx.restore();
   }
@@ -752,7 +747,7 @@ export class Renderer {
 
     // Crisp 2px (screen) edge lines.
     ctx.strokeStyle = css(pal.edge);
-    ctx.lineWidth = 2 / this.scale;
+    ctx.lineWidth = 3 / this.scale;
     ctx.lineJoin = 'round';
     ctx.beginPath();
     spline(ctx, lx, ly, true, false);
@@ -760,6 +755,29 @@ export class Renderer {
     ctx.beginPath();
     spline(ctx, rx, ry, true, false);
     ctx.stroke();
+
+    // Corner kerbs: red/white blocks on both edges of every corner.
+    const n0 = nodes[0].s;
+    ctx.lineCap = 'butt';
+    ctx.lineWidth = 6;
+    for (const c of track.corners) {
+      const i0 = Math.max(a, Math.round((c.s0 - n0) / NODE_SPACING) - 1);
+      const i1 = Math.min(b, Math.round((c.s1 - n0) / NODE_SPACING) + 1);
+      if (i1 <= i0) continue;
+      for (const side of [-1, 1]) {
+        const off = side * (hw - 4);
+        for (let i = i0; i < i1; i++) {
+          const p = nodes[i];
+          const q2 = nodes[i + 1];
+          ctx.strokeStyle = i % 2 === 0 ? css(pal.accent) : css(pal.edge, 0.9);
+          ctx.beginPath();
+          ctx.moveTo(p.x + p.nx * off, p.y + p.ny * off);
+          ctx.lineTo(q2.x + q2.nx * off, q2.y + q2.ny * off);
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.lineCap = 'round';
 
     // Reflector posts every 140px — strong, cheap sense of speed.
     ctx.fillStyle = css(pal.edge, 0.4);

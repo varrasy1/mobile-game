@@ -43,18 +43,17 @@ interface Template {
 }
 
 const TEMPLATES: Template[] = [
-  { stat: 'perfects', goals: [2, 4, 7, 10, 15], text: (n) => `Hit ${n} PERFECT apexes` },
-  { stat: 'sector', goals: [2, 3, 4, 5, 6, 8], text: (n) => `Reach sector ${n}` },
+  { stat: 'perfects', goals: [2, 4, 7, 10, 15], text: (n) => `${n} PERFECT corners` },
+  { stat: 'sector', goals: [2, 3, 4, 5, 6, 8], text: (n) => `Reach zone ${n}` },
   { stat: 'bestDrift', goals: [800, 1600, 3000, 5000, 8000], text: (n) => `Bank a ${fmt(n)} drift` },
-  { stat: 'score', goals: [5000, 12000, 25000, 45000, 80000], text: (n) => `Score ${fmt(n)} in one run` },
+  { stat: 'score', goals: [15000, 40000, 90000, 180000, 350000], text: (n) => `Score ${fmt(n)} in one run` },
   { stat: 'nitros', goals: [1, 3, 5, 8], text: (n) => `Fire nitro ${n}×` },
   { stat: 'insane', goals: [1, 2, 4, 7], text: (n) => `Pull ${n} INSANE drift${n > 1 ? 's' : ''}` },
   { stat: 'chains', goals: [1, 3, 5, 8, 12], text: (n) => `Complete ${n} light chain${n > 1 ? 's' : ''}` },
   { stat: 'topKmh', goals: [220, 260, 300, 340], text: (n) => `Top ${n} km/h` },
-  { stat: 'streak', goals: [4, 7, 10, 15, 20], text: (n) => `Reach ${n}x flow` },
+  { stat: 'streak', goals: [3, 5, 7, 9], text: (n) => `Build a ×${n} combo` },
   { stat: 'coins', goals: [40, 90, 160, 260], text: (n) => `Collect ${n} coins in a run` },
-  { stat: 'nearMisses', goals: [3, 8, 15, 25, 40], text: (n) => `${n} close calls in traffic` },
-  { stat: 'takedowns', goals: [1, 3, 6, 10, 15], text: (n) => `${n} nitro takedown${n > 1 ? 's' : ''}` },
+
 ];
 
 export interface Mission {
@@ -157,7 +156,8 @@ export class Progress {
         this.xp = Math.max(0, Math.floor(s.xp ?? 0));
         if (Array.isArray(s.owned) && s.owned.length) this.owned = s.owned.filter((x) => typeof x === 'string');
         if (typeof s.selected === 'string' && this.owned.includes(s.selected)) this.selected = s.selected;
-        if (Array.isArray(s.missions)) this.missions = s.missions.slice(0, 3);
+        const live = new Set(TEMPLATES.map((t) => t.stat));
+        if (Array.isArray(s.missions)) this.missions = s.missions.filter((m) => live.has(m.stat)).slice(0, 3);
         this.nextSeq = Math.max(0, Math.floor(s.nextSeq ?? 0));
         if (s.tuning && typeof s.tuning === 'object') this.tuning = s.tuning;
         if (Array.isArray(s.paints)) this.paints = s.paints.filter((x) => typeof x === 'string');
@@ -218,7 +218,7 @@ export class Progress {
   /** End of run: grant XP + coins, roll completed missions. Returns levels gained. */
   finishRun(run: RunStats): { xpGained: number; levelsGained: number; levelCoins: number } {
     const before = this.level;
-    const xpGained = Math.floor(run.score / 10);
+    const xpGained = Math.floor(run.score / 80);
     this.xp += xpGained;
     this.coins += run.coins;
     const after = this.level;
