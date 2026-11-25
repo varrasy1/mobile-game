@@ -1,5 +1,7 @@
 import { AudioEngine } from './audio';
 import { BASE_SPEED, Car, InputController, TOP_SPEED, autopilotSteer, followSteer } from './car';
+import { CARS, carById, drawCar as drawCarModel, type CarModel } from './cars';
+import { Progress, emptyRun, type Mission, type RunStats } from './progress';
 import { Renderer, type GhostPose } from './renderer';
 import {
   GHOST_INTERVAL,
@@ -15,35 +17,33 @@ import { Theme } from './theme';
 import { Track, distToPolyline, type TrackQuery } from './track';
 
 /**
- * TITLE → PLAYING → ENDING (flow ran dry, car eases off) → RESULTS → PLAYING …
- * The canvas, track and car are never reset: every run continues seamlessly
- * from wherever the car is.
+ * TITLE → PLAYING → ENDING (time ran out, car eases off) → RESULTS → PLAYING …
+ * The canvas, track and car are never reset: every run continues seamlessly.
  */
 type GameState = 'TITLE' | 'PLAYING' | 'ENDING' | 'RESULTS';
 
 // ───────────────────────── tuning ─────────────────────────
 
-const SECTOR_LENGTH = 15000; // px → 1.5 km
-/** Lateral speed (px/s) at which a held input moves your line across the road. */
-const LANE_SPEED = 240;
-/** How far past the edge the line may be pushed (onto the gravel). */
+const SECTOR_LENGTH = 15000; // px → 1.5 km between checkpoints
 const LANE_OVERHANG = 26;
-const FLOW_DRAIN = 0.032; // per second (≈ 30 s from full with no rewards)
-const FLOW_DRAIN_PER_SECTOR = 0.006;
-const FLOW_OFFROAD_DRAIN = 0.05;
-const FLOW_APEX = 0.065;
-const FLOW_PERFECT = 0.11;
-const FLOW_ORB = 0.004;
-const FLOW_CHAIN = 0.05;
-const FLOW_PAD = 0.05;
-const FLOW_SECTOR = 0.3;
+const START_TIME = 30;
+const MAX_TIME = 60;
+const OFFROAD_DRAIN = 0.6; // extra seconds per second off the asphalt
+const T_APEX = 0.8;
+const T_PERFECT = 1.6;
+const T_CHAIN = 1.5;
+const T_PAD = 0.4;
+const T_DRIFT = [0, 0.5, 1.2, 2.5];
 const PERFECT_DIST = 15;
 const APEX_DIST = 26;
 const CHAIN_LENGTH = 11;
-const DRIFT_MIN_DEG = 8;
-const DRIFT_END_DEG = 5;
 const BOOST_TIME = 1.4;
 const BOOST_SPEED = 150;
+const NITRO_SPEED = 150;
+const NITRO_MIN = 0.25;
+const DRIFT_TIERS = [0.7, 1.5, 2.5]; // seconds → GOOD / GREAT / INSANE
+const DRIFT_NAMES = ['', 'GOOD DRIFT', 'GREAT DRIFT', 'INSANE DRIFT'];
+const KMH = 0.6;
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -56,24 +56,50 @@ const titleEl = $('title');
 const bestEl = $('best');
 const hudEl = $('hud');
 const scoreEl = $('score');
-const streakEl = $('streak');
-const flowFill = $('flow-fill');
-const flowEl = $('flow');
+const multEl = $('mult');
+const timeEl = $('time');
+const timerEl = $('timer');
+const cpFill = $('cp-fill');
+const speedEl = $('speed');
 const driftEl = $('drift');
 const bannerEl = $('banner');
 const hintEl = $('hint');
 const resultsEl = $('results');
+const nitroBtn = $<HTMLButtonElement>('nitro');
+const nitroRing = $('nitro-ring');
 const themeBtn = $<HTMLButtonElement>('btn-theme');
 const audioBtn = $<HTMLButtonElement>('btn-audio');
+const metaLevel = $('meta-level');
+const metaXp = $('meta-xp-fill');
+const metaCoins = $('meta-coins');
+const missionsEl = $('missions');
+const garageEl = $('garage');
+const garageCanvas = $<HTMLCanvasElement>('garage-canvas');
 
 // ───────────────────────── setup ─────────────────────────
 
 const prefs = loadPrefs();
 const theme = new Theme(prefs.theme);
 const audio = new AudioEngine(prefs.muted);
+const progress = new Progress();
 const track = new Track((Math.random() * 2 ** 32) >>> 0);
 const car = new Car();
 const renderer = new Renderer(canvas, theme);
+
+let model: CarModel = carById(progress.selected);
+let speedBonus = 0;
+let laneSpeed = 240;
+let nitroFactor = 1;
+
+function applyModel(m: CarModel): void {
+  model = m;
+  renderer.setModel(m);
+  speedBonus = (m.stats.speed - 2) * 14;
+  laneSpeed = 220 + (m.stats.handling - 2) * 28;
+  car.handling = (m.stats.handling - 2) * 0.12;
+  nitroFactor = 0.8 + m.stats.nitro * 0.12;
+}
+applyModel(model);
 
 let state: GameState = 'TITLE';
 let stateTime = 0;
@@ -81,26 +107,36 @@ let q: TrackQuery = track.nearest(car.x, car.y);
 let time = 0;
 
 // Run state
+let run: RunStats = emptyRun();
 let streak = 0;
-let bestStreak = 0;
 let bonus = 0;
+let distPts = 0;
 let startS = 0;
 let maxS = 0;
 let runTime = 0;
 let score = 0;
-let flow = 1;
+let timeLeft = START_TIME;
 let sector = 0;
-let perfects = 0;
-let orbsTaken = 0;
 let chainIdx = -1;
 let chainCount = 0;
-let drift = 0;
-let driftCalm = 0;
 let boostT = 0;
 let glow = 0;
 let newBest = false;
-/** The player's chosen line: lateral offset from the centre line (+ = right). */
 let lane = 0;
+let lastTick = 0;
+
+// Drift + nitro
+let drifting = false;
+let driftSide = 0;
+let driftT = 0;
+let driftPts = 0;
+let driftTier = 0;
+let driftGrace = 0;
+let driftRelease = 0;
+let driftAngle = 0;
+let nitro = 0; // charge 0…1
+let nitroT = 0; // seconds of burn left
+let nitroDur = 1;
 
 // Personal best + ghost
 let bestScore = loadBest();
@@ -112,57 +148,89 @@ let lastPersist = 0;
 
 const fmt = (n: number): string => Math.floor(n).toLocaleString('en-US');
 const wrapAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
+const COIN = '◈';
 
-function showBestOnTitle(): void {
+// ───────────────────────── meta UI ─────────────────────────
+
+function missionLine(m: Mission, current?: number): string {
+  const prog = current !== undefined && !m.done ? `<em>${fmt(Math.min(current, m.goal))}/${fmt(m.goal)}</em>` : '';
+  return `<li class="${m.done ? 'done' : ''}"><span class="m-check">${m.done ? '✓' : ''}</span><span class="m-text">${m.text}</span>${prog}<span class="m-reward">${COIN} ${m.reward}</span></li>`;
+}
+
+function renderMeta(): void {
+  metaLevel.textContent = `LV ${progress.level}`;
+  metaXp.style.transform = `scaleX(${progress.levelProgress.toFixed(3)})`;
+  metaCoins.textContent = `${COIN} ${fmt(progress.coins)}`;
+  missionsEl.innerHTML = progress.missions.map((m) => missionLine(m)).join('');
   if (bestScore > 0) {
     bestEl.textContent = `BEST ${fmt(bestScore)}`;
     bestEl.hidden = false;
   }
 }
-showBestOnTitle();
+renderMeta();
 
 // ───────────────────────── HUD ─────────────────────────
 
-let shownScore = -1;
-let shownStreak = -1;
-let shownDrift = -1;
+let shown = { score: -1, mult: -1, time: -1, speed: -1, drift: '', nitro: -1 };
 let bannerTimer: number | undefined;
+let driftTimer: number | undefined;
 
 function renderHud(): void {
-  if (Math.floor(score) !== shownScore) {
-    shownScore = Math.floor(score);
+  if (score !== shown.score) {
+    shown.score = score;
     scoreEl.textContent = fmt(score);
   }
-  if (streak !== shownStreak) {
-    shownStreak = streak;
+  if (streak !== shown.mult) {
+    shown.mult = streak;
     if (streak >= 2) {
-      streakEl.textContent = `${streak}x FLOW`;
-      streakEl.classList.add('show');
-      streakEl.classList.remove('bump');
-      void streakEl.offsetWidth; // restart the bump animation
-      streakEl.classList.add('bump');
-    } else {
-      streakEl.classList.remove('show');
-    }
+      multEl.textContent = `${streak}x FLOW`;
+      multEl.classList.add('show');
+      multEl.classList.remove('bump');
+      void multEl.offsetWidth;
+      multEl.classList.add('bump');
+    } else multEl.classList.remove('show');
   }
-  flowFill.style.transform = `scaleX(${Math.max(0, flow).toFixed(4)})`;
-  flowEl.classList.toggle('low', flow < 0.25 && state === 'PLAYING');
-
-  const d = Math.floor(drift);
-  if (d !== shownDrift) {
-    shownDrift = d;
-    if (d >= 30) {
-      driftEl.textContent = `DRIFT ${fmt(d)}`;
-      driftEl.classList.add('show');
-    } else driftEl.classList.remove('show');
+  const t = Math.ceil(Math.max(0, timeLeft));
+  if (t !== shown.time) {
+    shown.time = t;
+    timeEl.textContent = String(t);
+  }
+  timerEl.classList.toggle('low', state === 'PLAYING' && timeLeft < 8);
+  cpFill.style.transform = `scaleX(${(((maxS - startS) % SECTOR_LENGTH) / SECTOR_LENGTH).toFixed(4)})`;
+  const kmh = Math.round(car.speed * KMH);
+  if (kmh !== shown.speed) {
+    shown.speed = kmh;
+    speedEl.innerHTML = `${kmh}<small>km/h</small>`;
+  }
+  const n = Math.round(nitro * 100);
+  if (n !== shown.nitro || nitroT > 0) {
+    shown.nitro = n;
+    const v = nitroT > 0 ? nitroT / nitroDur : nitro;
+    nitroRing.style.strokeDashoffset = String((1 - v) * 163.4);
+    nitroBtn.classList.toggle('ready', nitro >= NITRO_MIN && nitroT <= 0);
+    nitroBtn.classList.toggle('burning', nitroT > 0);
   }
 }
 
-function banner(text: string): void {
-  bannerEl.textContent = text;
+function banner(text: string, sub = ''): void {
+  bannerEl.innerHTML = sub ? `${text}<small>${sub}</small>` : text;
   bannerEl.classList.add('show');
   window.clearTimeout(bannerTimer);
-  bannerTimer = window.setTimeout(() => bannerEl.classList.remove('show'), 1800);
+  bannerTimer = window.setTimeout(() => bannerEl.classList.remove('show'), 1900);
+}
+
+function showDrift(text: string, hold = false): void {
+  if (text === shown.drift && hold) return;
+  shown.drift = text;
+  driftEl.textContent = text;
+  driftEl.classList.add('show');
+  window.clearTimeout(driftTimer);
+  if (!hold) driftTimer = window.setTimeout(() => driftEl.classList.remove('show'), 1100);
+}
+
+function hideDrift(): void {
+  shown.drift = '';
+  driftEl.classList.remove('show');
 }
 
 function syncButtons(): void {
@@ -190,11 +258,129 @@ audioBtn.addEventListener('click', () => {
   audioBtn.blur();
 });
 
+// ───────────────────────── garage ─────────────────────────
+
+let garageOpen = false;
+let garageIdx = Math.max(0, CARS.findIndex((c) => c.id === model.id));
+
+function statBars(v: number): string {
+  return Array.from({ length: 5 }, (_, i) => `<i class="${i < v ? 'on' : ''}"></i>`).join('');
+}
+
+function renderGarage(): void {
+  const c = CARS[garageIdx];
+  const owned = progress.owned.includes(c.id);
+  const selected = progress.selected === c.id;
+  const levelOk = progress.level >= c.level;
+  $('g-coins').textContent = `${COIN} ${fmt(progress.coins)}`;
+  $('g-level').textContent = `LV ${progress.level}`;
+  $('g-name').textContent = c.name;
+  $('g-tag').textContent = c.tagline;
+  $('g-count').textContent = `${garageIdx + 1} / ${CARS.length}`;
+  $('g-stats').innerHTML = `
+    <div><span>SPEED</span><b>${statBars(c.stats.speed)}</b></div>
+    <div><span>HANDLING</span><b>${statBars(c.stats.handling)}</b></div>
+    <div><span>NITRO</span><b>${statBars(c.stats.nitro)}</b></div>`;
+  const btn = $<HTMLButtonElement>('g-action');
+  btn.disabled = false;
+  btn.className = '';
+  if (selected) {
+    btn.textContent = 'SELECTED';
+    btn.disabled = true;
+  } else if (owned) btn.textContent = 'SELECT';
+  else if (!levelOk) {
+    btn.textContent = `UNLOCKS AT LV ${c.level}`;
+    btn.disabled = true;
+    btn.className = 'locked';
+  } else if (progress.coins < c.price) {
+    btn.textContent = `${COIN} ${fmt(c.price)}`;
+    btn.disabled = true;
+    btn.className = 'locked';
+  } else {
+    btn.textContent = `BUY ${COIN} ${fmt(c.price)}`;
+    btn.className = 'buy';
+  }
+}
+
+function openGarage(): void {
+  if (state === 'PLAYING' || state === 'ENDING') return;
+  garageOpen = true;
+  garageIdx = Math.max(0, CARS.findIndex((c) => c.id === model.id));
+  renderGarage();
+  garageEl.classList.add('show');
+  audio.unlock();
+}
+
+function closeGarage(): void {
+  garageOpen = false;
+  garageEl.classList.remove('show');
+  renderMeta();
+}
+
+document.querySelectorAll<HTMLButtonElement>('.garage-open').forEach((b) =>
+  b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openGarage();
+    b.blur();
+  }),
+);
+$('g-close').addEventListener('click', closeGarage);
+$('g-prev').addEventListener('click', () => {
+  garageIdx = (garageIdx + CARS.length - 1) % CARS.length;
+  renderGarage();
+  audio.blip(2, 0.03);
+});
+$('g-next').addEventListener('click', () => {
+  garageIdx = (garageIdx + 1) % CARS.length;
+  renderGarage();
+  audio.blip(4, 0.03);
+});
+$('g-action').addEventListener('click', () => {
+  const c = CARS[garageIdx];
+  if (progress.owned.includes(c.id)) progress.select(c.id);
+  else if (progress.level >= c.level && progress.buy(c.id, c.price)) {
+    audio.chord();
+    navigator.vibrate?.([12, 40, 12]);
+  } else return;
+  applyModel(c);
+  renderGarage();
+});
+
+function drawGaragePreview(): void {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  const w = garageCanvas.clientWidth;
+  const h = garageCanvas.clientHeight;
+  if (garageCanvas.width !== Math.round(w * dpr)) {
+    garageCanvas.width = Math.round(w * dpr);
+    garageCanvas.height = Math.round(h * dpr);
+  }
+  const g = garageCanvas.getContext('2d');
+  if (!g) return;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, garageCanvas.width, garageCanvas.height);
+  const c = CARS[garageIdx];
+  const scale = Math.min(w / 34, h / 52);
+  const angle = -Math.PI / 2 + Math.sin(time * 0.6) * 0.5;
+  g.setTransform(dpr * scale, 0, 0, dpr * scale, (dpr * w) / 2, (dpr * h) / 2);
+  g.rotate(angle + Math.PI / 2);
+  const locked = !progress.owned.includes(c.id);
+  g.globalAlpha = locked ? 0.55 : 1;
+  drawCarModel(g, c, {
+    pal: theme.palette,
+    steer: Math.sin(time * 1.3) * 0.6,
+    glow: 0.5 + 0.5 * Math.sin(time * 2),
+    nitro: locked ? 0 : 0.6 + 0.4 * Math.sin(time * 5),
+    time,
+    worldAngle: angle,
+    pxScale: dpr * scale,
+  });
+}
+
 // ───────────────────────── state machine ─────────────────────────
 
 let hinted = false;
 try {
-  hinted = localStorage.getItem('flowline.hinted') === '1';
+  hinted = localStorage.getItem('flowline.hinted.v2') === '1';
 } catch {
   /* ignore */
 }
@@ -206,23 +392,24 @@ function setState(next: GameState): void {
 
 function startRun(): void {
   setState('PLAYING');
-  startS = q.s;
-  maxS = q.s;
+  run = emptyRun();
+  startS = maxS = q.s;
   runTime = 0;
-  streak = bestStreak = 0;
-  bonus = 0;
-  score = 0;
-  flow = 1;
+  streak = 0;
+  bonus = distPts = score = 0;
+  timeLeft = START_TIME;
   sector = 0;
-  perfects = orbsTaken = 0;
   chainIdx = -1;
   chainCount = 0;
-  drift = 0;
   boostT = 0;
+  drifting = false;
+  driftAngle = 0;
+  nitro = 0;
+  nitroT = 0;
   newBest = false;
   recording = [];
   sampleClock = 0;
-  shownStreak = -1;
+  shown = { score: -1, mult: -1, time: -1, speed: -1, drift: '', nitro: -1 };
   lane = q.lateral;
   theme.setMood(0);
   for (const ap of track.apexes) if (ap.s < q.s + 30) ap.passed = true;
@@ -234,10 +421,10 @@ function startRun(): void {
   hudEl.classList.add('playing');
   if (!hinted) {
     hintEl.classList.add('show');
-    window.setTimeout(() => hintEl.classList.remove('show'), 5200);
+    window.setTimeout(() => hintEl.classList.remove('show'), 6500);
     hinted = true;
     try {
-      localStorage.setItem('flowline.hinted', '1');
+      localStorage.setItem('flowline.hinted.v2', '1');
     } catch {
       /* ignore */
     }
@@ -246,8 +433,11 @@ function startRun(): void {
 
 function endRun(): void {
   setState('ENDING');
-  bankDrift(false);
+  endDrift(false);
+  nitroT = 0;
   streak = 0;
+  hideDrift();
+  banner('TIME UP');
   audio.fadeOut();
   navigator.vibrate?.([20, 60, 20]);
   if (newBest) {
@@ -258,54 +448,103 @@ function endRun(): void {
 
 function showResults(): void {
   setState('RESULTS');
+  run.score = score;
+  const levelBefore = progress.level;
+  const missionsThisRun = progress.missions.map((m) => ({ ...m }));
+  const missionCoins = missionsThisRun.filter((m) => m.done).reduce((a, m) => a + m.reward, 0);
+  const res = progress.finishRun(run);
   const dist = Math.floor((maxS - startS) / 10);
+  const earned = run.coins + missionCoins + res.levelCoins;
   resultsEl.innerHTML = `
-    <div class="r-label">${newBest ? '<span class="r-best">NEW BEST</span>' : 'FLOW FADED'}</div>
+    <div class="r-label">${newBest ? '<span class="r-best">NEW BEST</span>' : `SECTOR ${run.sector}`}</div>
     <div class="r-score">${fmt(score)}</div>
     <div class="r-stats">
       <div><b>${fmt(dist)}</b><span>meters</span></div>
-      <div><b>${bestStreak}x</b><span>best flow</span></div>
-      <div><b>${perfects}</b><span>perfect</span></div>
-      <div><b>${orbsTaken}</b><span>lights</span></div>
+      <div><b>${run.streak}x</b><span>best flow</span></div>
+      <div><b>${run.perfects}</b><span>perfect</span></div>
+      <div><b>${fmt(run.bestDrift)}</b><span>best drift</span></div>
     </div>
-    <div class="r-sub">${newBest ? '' : `best ${fmt(bestScore)}`}</div>
+    <div class="r-xp">
+      <div class="r-xp-row"><span>LV ${progress.level}${res.levelsGained ? ' <b class="r-up">LEVEL UP!</b>' : ''}</span><span>+${fmt(res.xpGained)} XP</span></div>
+      <div class="xp-bar"><div style="transform:scaleX(${progress.levelProgress.toFixed(3)})"></div></div>
+    </div>
+    <div class="r-coins">+${COIN} ${fmt(earned)}</div>
+    <ul class="r-missions">${missionsThisRun.map((m) => missionLine(m, run[m.stat])).join('')}</ul>
+    <div class="r-actions"><button type="button" class="garage-btn garage-open-r">GARAGE${unlockable() ? ' <i class="dot"></i>' : ''}</button></div>
     <div class="r-prompt">Tap to drive again</div>`;
+  resultsEl.querySelector('.garage-open-r')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openGarage();
+  });
   resultsEl.classList.add('show');
   hudEl.classList.remove('playing');
+  if (progress.level > levelBefore) {
+    audio.chord();
+    navigator.vibrate?.([15, 50, 15, 50, 25]);
+  }
+  renderMeta();
+}
+
+/** True if any car can be bought right now (shows a dot on the garage button). */
+function unlockable(): boolean {
+  return CARS.some((c) => !progress.owned.includes(c.id) && progress.level >= c.level && progress.coins >= c.price);
 }
 
 const input = new InputController(canvas, () => {
   audio.unlock();
+  if (garageOpen) return;
   if (state === 'TITLE') startRun();
-  else if (state === 'RESULTS' && stateTime > 0.7) startRun();
+  else if (state === 'RESULTS' && stateTime > 0.8) startRun();
+});
+
+function fireNitro(): void {
+  if (state !== 'PLAYING' || nitroT > 0 || nitro < NITRO_MIN) return;
+  nitroDur = (0.8 + 2.6 * nitro) * nitroFactor;
+  nitroT = nitroDur;
+  nitro = 0;
+  run.nitros++;
+  car.boost(90);
+  renderer.kick(0.6);
+  audio.boost();
+  banner('NITRO');
+  navigator.vibrate?.(25);
+}
+
+nitroBtn.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  audio.unlock();
+  fireNitro();
+});
+nitroBtn.addEventListener('mousedown', (e) => {
+  e.stopPropagation();
+  fireNitro();
+});
+window.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    if (state === 'PLAYING') {
+      e.preventDefault();
+      fireNitro();
+    }
+  }
+  if (e.code === 'Escape' && garageOpen) closeGarage();
 });
 
 function breakStreak(): void {
-  if (streak > 0) streak = 0;
+  streak = 0;
 }
 
 function addScore(pts: number): void {
-  bonus += pts;
+  bonus += pts * (nitroT > 0 ? 2 : 1);
 }
 
-function addFlow(v: number): void {
-  flow = Math.min(1, flow + v);
+function addTime(t: number): void {
+  timeLeft = Math.min(MAX_TIME, timeLeft + t);
 }
 
-function bankDrift(clean: boolean): void {
-  if (drift >= 30) {
-    if (clean) {
-      const pts = Math.floor(drift * (1 + streak * 0.2));
-      addScore(pts);
-      addFlow(Math.min(0.12, pts / 4000));
-      renderer.popup(car.x, car.y - 26, `DRIFT +${fmt(pts)}`, false, 13);
-      audio.blip(7, 0.05);
-    } else {
-      renderer.popup(car.x, car.y - 26, 'DRIFT LOST', false, 11);
-    }
-  }
-  drift = 0;
-  driftCalm = 0;
+function addCoins(n: number): void {
+  run.coins += n;
 }
 
 function persistBest(force = false): void {
@@ -354,15 +593,16 @@ function collectApex(ap: (typeof track.apexes)[number]): void {
   ap.collected = true;
   ap.fade = 0;
   streak += 1;
-  bestStreak = Math.max(bestStreak, streak);
+  run.streak = Math.max(run.streak, streak);
   const pts = 100 * streak * (perfect ? 2 : 1);
   addScore(pts);
-  addFlow(perfect ? FLOW_PERFECT : FLOW_APEX);
+  addTime(perfect ? T_PERFECT : T_APEX);
   car.boost(perfect ? 40 : 25);
   renderer.spawnRipple(ap.mx, ap.my, perfect);
   renderer.popup(ap.mx, ap.my - 10, perfect ? `PERFECT +${fmt(pts)}` : `+${fmt(pts)}`, perfect, perfect ? 15 : 13);
   if (perfect) {
-    perfects++;
+    run.perfects++;
+    nitro = Math.min(1, nitro + 0.12 * nitroFactor);
     renderer.kick(0.35);
     navigator.vibrate?.([10, 40, 14]);
   } else navigator.vibrate?.(8);
@@ -378,7 +618,6 @@ function updateApexes(dt: number, playing: boolean): void {
     const d = playing ? distToPolyline(car.x, car.y, ap.pts) : Infinity;
     if (d < APEX_DIST) {
       ap.best = Math.min(ap.best, d);
-      // Inside the zone: grade once the car starts pulling away (or the arc ends).
       if (d > ap.best + 4 || q.s > ap.s + 56) collectApex(ap);
     } else if (ap.best < APEX_DIST) {
       collectApex(ap);
@@ -402,24 +641,25 @@ function updateOrbs(dt: number, playing: boolean): void {
     }
     const dx = o.x - car.x;
     const dy = o.y - car.y;
-    if (dx * dx + dy * dy < 20 * 20) {
+    if (dx * dx + dy * dy < 21 * 21) {
       o.taken = true;
       o.age = 0;
-      orbsTaken++;
       chainCount = o.idx === chainIdx + 1 ? chainCount + 1 : o.idx === 0 ? 1 : 0;
       chainIdx = o.idx;
       addScore(10 * Math.max(1, streak));
-      addFlow(FLOW_ORB);
+      addCoins(1);
       audio.blip(o.idx);
       if (chainCount === CHAIN_LENGTH) {
         const pts = 250 * Math.max(1, streak);
         addScore(pts);
-        addFlow(FLOW_CHAIN);
-        renderer.popup(car.x, car.y - 30, `CHAIN +${fmt(pts)}`, true, 14);
+        addTime(T_CHAIN);
+        addCoins(5);
+        run.chains++;
+        renderer.popup(car.x, car.y - 30, `CHAIN +${fmt(pts)}  ${COIN}5`, true, 14);
         navigator.vibrate?.(12);
       }
     } else if (o.s < q.s - 24) {
-      o.taken = true; // missed — quietly retire
+      o.taken = true;
       chainIdx = -1;
       chainCount = 0;
     }
@@ -435,8 +675,9 @@ function updatePads(playing: boolean): void {
       pad.used = true;
       boostT = BOOST_TIME;
       car.boost(110);
-      addFlow(FLOW_PAD);
+      addTime(T_PAD);
       addScore(50 * Math.max(1, streak));
+      nitro = Math.min(1, nitro + 0.08 * nitroFactor);
       renderer.kick(0.5);
       renderer.popup(car.x, car.y - 28, 'BOOST', true, 14);
       audio.boost();
@@ -445,19 +686,63 @@ function updatePads(playing: boolean): void {
   }
 }
 
-function updateDrift(dt: number, onRoad: boolean): void {
-  const slipDeg = (Math.abs(Math.atan2(car.vLateral, Math.max(1, car.vForward))) * 180) / Math.PI;
+// ── Drift: hold toward the inside of a bend to throw the tail out ──
+
+function endDrift(clean: boolean): void {
+  if (!drifting) return;
+  drifting = false;
+  if (driftTier > 0) {
+    if (clean) {
+      const pts = Math.floor(driftPts);
+      addScore(pts);
+      addTime(T_DRIFT[driftTier]);
+      run.bestDrift = Math.max(run.bestDrift, pts);
+      if (driftTier === 3) run.insane++;
+      showDrift(`${DRIFT_NAMES[driftTier]} +${fmt(pts)}`);
+      audio.blip(5 + driftTier * 2, 0.06);
+      navigator.vibrate?.(10);
+    } else {
+      showDrift('DRIFT LOST');
+    }
+  } else hideDrift();
+  driftT = driftPts = 0;
+  driftTier = 0;
+}
+
+function updateDrift(dt: number, cmd: number, onRoad: boolean): void {
+  const kAhead = track.curvatureAt(q.s + car.speed * 0.15);
+  const bendSide = Math.abs(kAhead) > 0.0011 ? Math.sign(kAhead) : 0;
   if (!onRoad) {
-    if (drift > 0) bankDrift(false);
+    endDrift(false);
     return;
   }
-  if (slipDeg > DRIFT_MIN_DEG && car.speed > 180) {
-    drift += slipDeg * car.speed * 0.02 * dt;
-    driftCalm = 0;
-  } else if (drift > 0) {
-    if (slipDeg < DRIFT_END_DEG) driftCalm += dt;
-    if (driftCalm > 0.3) bankDrift(true);
+  if (!drifting) {
+    if (bendSide !== 0 && cmd * bendSide > 0.25 && car.speed > 200) {
+      drifting = true;
+      driftSide = bendSide;
+      driftT = driftPts = 0;
+      driftTier = 0;
+      driftGrace = driftRelease = 0;
+    }
+    return;
   }
+  // Keep drifting while held into the bend; brief straights are forgiven.
+  driftGrace = bendSide === driftSide ? 0 : driftGrace + dt;
+  driftRelease = cmd * driftSide > 0.1 ? 0 : driftRelease + dt;
+  if (driftGrace > 0.35 || driftRelease > 0.12) {
+    endDrift(true);
+    return;
+  }
+  driftT += dt;
+  const tier = driftT >= DRIFT_TIERS[2] ? 3 : driftT >= DRIFT_TIERS[1] ? 2 : driftT >= DRIFT_TIERS[0] ? 1 : 0;
+  driftPts += 150 * Math.max(1, tier) * (1 + streak * 0.1) * dt;
+  nitro = Math.min(1, nitro + 0.32 * nitroFactor * dt);
+  if (tier > driftTier) {
+    driftTier = tier;
+    audio.blip(3 + tier * 2, 0.05);
+    if (tier === 3) renderer.kick(0.25);
+  }
+  if (tier > 0) showDrift(`${DRIFT_NAMES[tier]} ${fmt(driftPts)}`, true);
 }
 
 // ───────────────────────── loop ─────────────────────────
@@ -473,15 +758,30 @@ if (import.meta.env.DEV) {
       track,
       Car,
       Track,
+      progress,
       get state() {
-        return { state, streak, score, bestScore, flow, sector, perfects, orbsTaken, lane, samples: recording.length / 3 };
+        return {
+          state,
+          streak,
+          score,
+          bestScore,
+          timeLeft,
+          sector,
+          lane,
+          nitro,
+          drifting,
+          driftTier,
+          run,
+          samples: recording.length / 3,
+        };
       },
       autopilot(on: boolean) {
         debugAutopilot = on;
       },
-      setFlow(v: number) {
-        flow = v;
+      setTime(v: number) {
+        timeLeft = v;
       },
+      fireNitro,
     },
   });
 }
@@ -507,25 +807,34 @@ function step(now: number): void {
   const onRoadBefore = Math.abs(q.lateral) <= track.halfWidth;
 
   let steer: number;
+  let cmd = 0;
   if (!playing || debugAutopilot) {
     steer = autopilotSteer(car, track, q);
     lane = q.lateral;
   } else {
-    let cmd = input.steer;
+    cmd = input.steer;
     if (import.meta.env.DEV) {
       const bot = (window as { __botSteer?: () => number }).__botSteer;
       if (bot) cmd = bot();
     }
     const limit = track.halfWidth + LANE_OVERHANG;
-    lane = Math.max(-limit, Math.min(limit, lane + cmd * LANE_SPEED * dt));
+    const rate = laneSpeed * (drifting ? 0.3 : 1);
+    lane = Math.max(-limit, Math.min(limit, lane + cmd * rate * dt));
     steer = followSteer(car, track, q, lane);
   }
 
   boostT = Math.max(0, boostT - dt);
+  nitroT = Math.max(0, nitroT - dt);
   const boostAmt = boostT / BOOST_TIME;
+  const nitroAmt = nitroT > 0 ? Math.min(1, nitroT / 0.4, 0.6 + 0.4 * (nitroT / nitroDur)) : 0;
   let target: number;
   if (state === 'ENDING' || state === 'RESULTS') target = 150;
-  else target = Math.min(TOP_SPEED, BASE_SPEED + streak * 12 + sector * 22) + BOOST_SPEED * boostAmt;
+  else
+    target =
+      Math.min(TOP_SPEED + speedBonus, BASE_SPEED + speedBonus + streak * 12 + sector * 22) +
+      BOOST_SPEED * boostAmt +
+      (nitroT > 0 ? NITRO_SPEED : 0);
+  if (drifting) target *= 0.97;
   if (!onRoadBefore) target *= 0.72;
   car.update(dt, steer, target);
 
@@ -550,22 +859,35 @@ function step(now: number): void {
   if (playing) {
     runTime += dt;
     if (!onRoad) breakStreak();
-    updateDrift(dt, onRoad);
-    maxS = Math.max(maxS, q.s);
+    updateDrift(dt, cmd, onRoad);
+
+    if (q.s > maxS) {
+      distPts += ((q.s - maxS) / 10) * (nitroT > 0 ? 2 : 1);
+      maxS = q.s;
+    }
 
     const nextSector = Math.floor((maxS - startS) / SECTOR_LENGTH);
     if (nextSector > sector) {
       sector = nextSector;
+      run.sector = sector + 1;
       theme.setMood(sector);
-      addFlow(FLOW_SECTOR);
+      const extra = Math.max(10, 22 - 2 * sector);
+      addTime(extra);
       addScore(1000 * sector);
-      banner(`SECTOR ${sector + 1}`);
+      addCoins(10 * sector);
+      banner('CHECKPOINT', `+${extra}s · SECTOR ${sector + 1}`);
       audio.chord();
       navigator.vibrate?.([12, 50, 12]);
     }
 
-    flow -= (FLOW_DRAIN + sector * FLOW_DRAIN_PER_SECTOR + (onRoad ? 0 : FLOW_OFFROAD_DRAIN)) * dt;
-    score = Math.floor((maxS - startS) / 10) + bonus;
+    timeLeft -= (1 + (onRoad ? 0 : OFFROAD_DRAIN)) * dt;
+    if (timeLeft < 5.5 && Math.ceil(timeLeft) !== lastTick && timeLeft > 0) {
+      lastTick = Math.ceil(timeLeft);
+      audio.blip(-5, 0.05);
+    }
+    score = Math.floor(distPts + bonus);
+    run.score = score;
+    run.topKmh = Math.max(run.topKmh, Math.round(car.speed * KMH));
     recordGhost(dt);
     if (score > bestScore) {
       if (!newBest && bestScore > 0) {
@@ -577,28 +899,42 @@ function step(now: number): void {
       dirtyBest = true;
     }
     persistBest();
-    if (flow <= 0) {
-      flow = 0;
+    if (Math.floor(runTime * 4) !== Math.floor((runTime - dt) * 4)) {
+      for (const m of progress.checkMissions(run)) {
+        banner('MISSION COMPLETE', `${m.text} · ${COIN} ${m.reward}`);
+        audio.chord();
+        navigator.vibrate?.([10, 30, 10]);
+      }
+    }
+    if (timeLeft <= 0) {
+      timeLeft = 0;
       endRun();
     }
-  } else if (state === 'ENDING' && stateTime > 1.4) {
+  } else if (state === 'ENDING' && stateTime > 1.6) {
     showResults();
   }
 
+  // Drift visuals: tail swings out toward the outside of the bend.
+  const driftTarget = drifting ? driftSide * (0.42 + 0.22 * Math.min(1, Math.abs(track.curvatureAt(q.s)) / 0.004)) : 0;
+  driftAngle += (driftTarget - driftAngle) * (1 - Math.exp(-7 * dt));
+
   // Effects
   const slip = Math.abs(car.vLateral);
-  renderer.addTrail(car, onRoad && slip > 24, time);
+  const visualSlip = slip + Math.abs(driftAngle) * 140;
+  renderer.addTrail(car, onRoad && visualSlip > 24, time, driftAngle);
+  if (Math.abs(driftAngle) > 0.15 && onRoad) renderer.spawnSmoke(car, driftAngle, Math.min(1, Math.abs(driftAngle) * 1.6));
   if (!onRoad && car.speed > 60) renderer.spawnDust(car);
-  glow += ((slip > 28 || boostAmt > 0.1 ? 1 : 0) - glow) * (1 - Math.exp(-8 * dt));
+  glow += ((visualSlip > 28 || boostAmt > 0.1 || nitroT > 0 ? 1 : 0) - glow) * (1 - Math.exp(-8 * dt));
   renderer.updateEffects(dt, time);
-  renderer.updateCamera(dt, car, boostAmt);
+  renderer.updateCamera(dt, car, Math.max(boostAmt, nitroAmt));
   theme.update(dt);
 
   const speedNorm = Math.min(1, Math.max(0, (car.speed - BASE_SPEED * 0.7) / (TOP_SPEED - BASE_SPEED * 0.7)));
-  audio.update(speedNorm, slip, onRoad);
+  audio.update(speedNorm, visualSlip, onRoad);
 
-  renderer.render(car, track, ghostPose(), glow, { boost: boostAmt, time });
+  renderer.render(car, track, ghostPose(), glow, { boost: boostAmt, time, nitro: nitroAmt, drift: driftAngle });
   if (state !== 'TITLE') renderHud();
+  if (garageOpen) drawGaragePreview();
 }
 
 requestAnimationFrame((t) => {
@@ -623,6 +959,7 @@ window.addEventListener('orientationchange', () => setTimeout(onResize, 120));
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     persistBest(true);
+    progress.save();
     audio.suspend();
     input.reset();
   } else {
@@ -630,7 +967,10 @@ document.addEventListener('visibilitychange', () => {
     if (state !== 'TITLE') audio.unlock();
   }
 });
-window.addEventListener('pagehide', () => persistBest(true));
+window.addEventListener('pagehide', () => {
+  persistBest(true);
+  progress.save();
+});
 
 document.addEventListener('gesturestart', (e) => e.preventDefault());
 document.addEventListener('dblclick', (e) => e.preventDefault());
@@ -642,3 +982,4 @@ if ('serviceWorker' in navigator && import.meta.env.PROD) {
     });
   });
 }
+

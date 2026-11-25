@@ -1,10 +1,12 @@
 import { BASE_SPEED, MAX_SPEED, TOP_SPEED, type Car } from './car';
+import { CARS, drawCar as drawCarModel, type CarModel } from './cars';
 import { css, type Palette, type Theme } from './theme';
 import { NODE_SPACING, type Track } from './track';
 
 const DPR_CAP = 2.5;
 const TRAIL_LIFE = 1.6;
 const DUST_LIFE = 0.8;
+const SMOKE_LIFE = 1.0;
 const RIPPLE_LIFE = 1.0;
 const MAX_DUST = 140;
 const POPUP_LIFE = 1.1;
@@ -26,6 +28,7 @@ interface TrailPoint {
 }
 
 interface Dust {
+  smoke: boolean;
   x: number;
   y: number;
   vx: number;
@@ -59,6 +62,12 @@ export interface FrameFx {
   /** 0…1 boost intensity. */
   boost: number;
   time: number;
+  /** 0…1 nitro flame intensity. */
+  nitro: number;
+  /** Visual drift yaw added to the car's facing (radians). */
+  drift: number;
+  /** Ghost car model id. */
+  ghostModel?: CarModel;
 }
 
 type View = { l: number; r: number; t: number; b: number };
@@ -89,6 +98,7 @@ export class Renderer {
   private popups: Popup[] = [];
   private streaks: Streak[] = [];
   private shake = 0;
+  private model: CarModel = CARS[0];
 
   // Scratch buffers for the visible road strip.
   private lx: number[] = [];
@@ -165,11 +175,24 @@ export class Renderer {
 
   // ───────────────────────── effects ─────────────────────────
 
-  addTrail(car: Car, active: boolean, time: number): void {
+  setModel(model: CarModel): void {
+    this.model = model;
+  }
+
+  /** World position of a local-frame point (x right, y rearward) on the car body incl. drift yaw. */
+  private bodyPoint(car: Car, drift: number, lx: number, ly: number): [number, number] {
+    const a = car.angle + drift;
+    const fx = Math.cos(a);
+    const fy = Math.sin(a);
+    return [car.x - fy * lx - fx * ly, car.y + fx * lx - fy * ly];
+  }
+
+  addTrail(car: Car, active: boolean, time: number, drift = 0): void {
     if (active) {
       const start = !this.trailing;
-      const [lx, ly] = car.local(-8.6, 13);
-      const [rx, ry] = car.local(8.6, 13);
+      const [l, r] = this.model.rearWheels;
+      const [lx, ly] = this.bodyPoint(car, drift, l[0], l[1]);
+      const [rx, ry] = this.bodyPoint(car, drift, r[0], r[1]);
       this.trailL.push({ x: lx, y: ly, t: time, start });
       this.trailR.push({ x: rx, y: ry, t: time, start });
     }
@@ -184,12 +207,33 @@ export class Renderer {
       const a = Math.random() * Math.PI * 2;
       const sp = 10 + Math.random() * 28;
       this.dust.push({
+        smoke: false,
         x,
         y,
         vx: Math.cos(a) * sp - car.vx * 0.08,
         vy: Math.sin(a) * sp - car.vy * 0.08,
         age: 0,
         size: 1 + Math.random() * 2.2,
+      });
+    }
+  }
+
+  /** Tyre smoke from the rear wheels while drifting. */
+  spawnSmoke(car: Car, drift: number, amount: number): void {
+    if (this.dust.length >= MAX_DUST) return;
+    for (const w of this.model.rearWheels) {
+      if (Math.random() > amount) continue;
+      const [x, y] = this.bodyPoint(car, drift, w[0], w[1]);
+      const a = Math.random() * Math.PI * 2;
+      const sp = 8 + Math.random() * 18;
+      this.dust.push({
+        smoke: true,
+        x,
+        y,
+        vx: Math.cos(a) * sp - car.vx * 0.12,
+        vy: Math.sin(a) * sp - car.vy * 0.12,
+        age: 0,
+        size: 3 + Math.random() * 3,
       });
     }
   }
@@ -228,7 +272,7 @@ export class Renderer {
       p.vy *= drag;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-      if (p.age > DUST_LIFE) this.dust.splice(i, 1);
+      if (p.age > (p.smoke ? SMOKE_LIFE : DUST_LIFE)) this.dust.splice(i, 1);
     }
     for (let i = this.ripples.length - 1; i >= 0; i--) {
       this.ripples[i].age += dt;
@@ -274,9 +318,9 @@ export class Renderer {
     this.drawApexes(track, pal, view);
     this.drawOrbs(track, pal, view, fx.time);
     this.drawRipples(pal);
-    this.drawStreaks(car, pal, view, fx.boost);
-    if (ghost && ghost.alpha > 0.002) this.drawGhost(ghost, pal);
-    this.drawCar(car, pal, glow);
+    this.drawStreaks(car, pal, view, Math.max(fx.boost, fx.nitro));
+    if (ghost && ghost.alpha > 0.002) this.drawGhost(ghost, pal, fx);
+    this.drawCar(car, pal, glow, fx);
     this.drawPopups(pal, ox, oy);
 
     // Grain, anchored to the world so it reads as asphalt/paper texture.
@@ -549,10 +593,10 @@ export class Renderer {
     ctx.save();
     ctx.fillStyle = css(pal.dust, 1 / pal.dust[3]);
     for (const p of this.dust) {
-      const life = 1 - p.age / DUST_LIFE;
-      ctx.globalAlpha = pal.dust[3] * life;
+      const life = 1 - p.age / (p.smoke ? SMOKE_LIFE : DUST_LIFE);
+      ctx.globalAlpha = p.smoke ? pal.dust[3] * 0.9 * life * life : pal.dust[3] * life;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size * (1 + (1 - life) * 1.5), 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, p.size * (1 + (1 - life) * (p.smoke ? 3.2 : 1.5)), 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.restore();
@@ -605,179 +649,42 @@ export class Renderer {
     }
   }
 
-  private drawGhost(g: GhostPose, pal: Palette): void {
+  private drawGhost(g: GhostPose, pal: Palette, fx: FrameFx): void {
     const { ctx } = this;
     ctx.save();
     ctx.translate(g.x, g.y);
     ctx.rotate(g.angle + Math.PI / 2);
     ctx.globalAlpha = g.alpha;
-    ctx.fillStyle = css(pal.carBody);
-    bodyPath(ctx);
-    ctx.fill();
-    ctx.fillStyle = css(pal.accent);
-    ctx.fillRect(-6.5, 18.6, 13, 1.6);
+    drawCarModel(ctx, fx.ghostModel ?? this.model, {
+      pal,
+      steer: 0,
+      glow: 0,
+      nitro: 0,
+      time: fx.time,
+      worldAngle: g.angle,
+      pxScale: this.dpr * this.scale,
+      ghost: true,
+    });
     ctx.restore();
   }
 
-  private drawPaint(angle: number, pal: Palette): void {
-    // Dark-bodied car (light theme) gets the deeper black-lacquer treatment.
-    const dark = pal.carBody[0] < 128;
-    paintGloss(this.ctx, angle, pal, dark);
-  }
-
-  private drawCar(car: Car, pal: Palette, glow: number): void {
+  private drawCar(car: Car, pal: Palette, glow: number, fx: FrameFx): void {
     const { ctx } = this;
+    const angle = car.angle + fx.drift;
     ctx.save();
     ctx.translate(car.x, car.y);
-    ctx.rotate(car.angle + Math.PI / 2);
-
-    // Soft contact shadow.
-    ctx.save();
-    ctx.shadowColor = css(pal.carShadow);
-    ctx.shadowBlur = 7 * this.dpr * this.scale;
-    ctx.shadowOffsetY = 2 * this.dpr * this.scale;
-    ctx.fillStyle = css(pal.carShadow);
-    ctx.beginPath();
-    ctx.roundRect(-9.5, -18, 19, 38, 8);
-    ctx.fill();
-    ctx.restore();
-
-    // Wheels — fronts pivot with steering.
-    ctx.fillStyle = css(pal.wheel);
-    const steerAngle = car.steer * 0.35;
-    for (const sx of [-1, 1]) {
-      ctx.save();
-      ctx.translate(sx * 8.9, -11);
-      ctx.rotate(steerAngle);
-      ctx.beginPath();
-      ctx.roundRect(-2.3, -4.2, 4.6, 8.4, 1.6);
-      ctx.fill();
-      ctx.restore();
-      ctx.beginPath();
-      ctx.roundRect(sx * 9.1 - 2.5, 11.5 - 4.6, 5, 9.2, 1.7);
-      ctx.fill();
-    }
-
-    // Sculpted body.
-    ctx.fillStyle = css(pal.carBody);
-    bodyPath(ctx);
-    ctx.fill();
-    this.drawPaint(car.angle, pal);
-
-    // Rear wing + diffuser detail.
-    ctx.strokeStyle = css(pal.canopy, 0.28);
-    ctx.lineWidth = 0.6;
-    ctx.beginPath();
-    ctx.moveTo(-8.6, 15.2);
-    ctx.lineTo(8.6, 15.2);
-    for (const dx of [-3, 0, 3]) {
-      ctx.moveTo(dx, 17.4);
-      ctx.lineTo(dx, 19.6);
-    }
-    ctx.stroke();
-
-    // Tinted wrap-around canopy.
-    ctx.fillStyle = css(pal.canopy);
-    ctx.beginPath();
-    ctx.moveTo(0, -7.5);
-    ctx.quadraticCurveTo(4.8, -6.8, 4.8, -1.5);
-    ctx.lineTo(4.1, 6);
-    ctx.quadraticCurveTo(3.7, 9.6, 0, 9.9);
-    ctx.quadraticCurveTo(-3.7, 9.6, -4.1, 6);
-    ctx.lineTo(-4.8, -1.5);
-    ctx.quadraticCurveTo(-4.8, -6.8, 0, -7.5);
-    ctx.closePath();
-    ctx.fill();
-    // Glass reflection.
-    ctx.strokeStyle = css(pal.carBody, 0.18);
-    ctx.lineWidth = 0.7;
-    ctx.beginPath();
-    ctx.moveTo(-2.6, -5.2);
-    ctx.quadraticCurveTo(0, -6.1, 2.6, -5.2);
-    ctx.stroke();
-
-    // LED taillight bar — glows brighter while drifting.
-    ctx.save();
-    ctx.shadowColor = css(pal.accent);
-    ctx.shadowBlur = (3 + glow * 12) * this.dpr * this.scale;
-    ctx.fillStyle = css(pal.accent, 0.78 + 0.22 * glow);
-    ctx.beginPath();
-    ctx.roundRect(-6.5, 18.7, 13, 1.7, 0.85);
-    ctx.fill();
-    ctx.restore();
-
+    ctx.rotate(angle + Math.PI / 2);
+    drawCarModel(ctx, this.model, {
+      pal,
+      steer: car.steer - fx.drift * 1.2,
+      glow,
+      nitro: fx.nitro,
+      time: fx.time,
+      worldAngle: angle,
+      pxScale: this.dpr * this.scale,
+    });
     ctx.restore();
   }
-}
-
-/**
- * Glossy clear-coat: the light comes from a fixed world direction (top-left),
- * so reflections glide across the body as the car turns.
- */
-function paintGloss(ctx: CanvasRenderingContext2D, angle: number, pal: Palette, darkBody: boolean): void {
-  // World light direction expressed in the car's local frame.
-  const rot = -(angle + Math.PI / 2);
-  const wx = -0.62;
-  const wy = -0.78;
-  const lx = wx * Math.cos(rot) - wy * Math.sin(rot);
-  const ly = wx * Math.sin(rot) + wy * Math.cos(rot);
-
-  ctx.save();
-  bodyPath(ctx);
-  ctx.clip();
-
-  // Broad sheen across the body.
-  const g = ctx.createLinearGradient(lx * 22, ly * 22, -lx * 22, -ly * 22);
-  g.addColorStop(0, `rgba(255,255,255,${darkBody ? 0.32 : 0.55})`);
-  g.addColorStop(0.42, 'rgba(255,255,255,0)');
-  g.addColorStop(1, `rgba(0,0,0,${darkBody ? 0.35 : 0.16})`);
-  ctx.fillStyle = g;
-  ctx.fillRect(-12, -22, 24, 44);
-
-  // Tight specular hot-spot on the lit shoulder.
-  const hx = lx * 6;
-  const hy = ly * 9;
-  const spec = ctx.createRadialGradient(hx, hy, 0, hx, hy, 9);
-  spec.addColorStop(0, `rgba(255,255,255,${darkBody ? 0.45 : 0.7})`);
-  spec.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = spec;
-  ctx.fillRect(hx - 9, hy - 9, 18, 18);
-
-  // Clear-coat rim on the lit edge.
-  ctx.strokeStyle = `rgba(255,255,255,${darkBody ? 0.28 : 0.4})`;
-  ctx.lineWidth = 0.8;
-  ctx.setLineDash([]);
-  ctx.translate(-lx * 0.7, -ly * 0.7);
-  bodyPath(ctx);
-  ctx.stroke();
-  ctx.restore();
-
-  // Accent pinstripe down the spine.
-  ctx.strokeStyle = css(pal.accent, 0.85);
-  ctx.lineWidth = 1.1;
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.moveTo(0, -18.6);
-  ctx.lineTo(0, -8.6);
-  ctx.stroke();
-}
-
-/** Car silhouette, nose at −y, 20 × 40. */
-function bodyPath(ctx: CanvasRenderingContext2D): void {
-  ctx.beginPath();
-  ctx.moveTo(0, -20);
-  ctx.quadraticCurveTo(5.6, -20, 7.2, -16.2);
-  ctx.bezierCurveTo(9.8, -13.5, 10, -8.5, 8.4, -4.5);
-  ctx.quadraticCurveTo(7.2, 0, 8.2, 4.5);
-  ctx.bezierCurveTo(10, 8.5, 10.2, 14.5, 9.2, 18);
-  ctx.quadraticCurveTo(8.6, 20, 6.4, 20);
-  ctx.lineTo(-6.4, 20);
-  ctx.quadraticCurveTo(-8.6, 20, -9.2, 18);
-  ctx.bezierCurveTo(-10.2, 14.5, -10, 8.5, -8.2, 4.5);
-  ctx.quadraticCurveTo(-7.2, 0, -8.4, -4.5);
-  ctx.bezierCurveTo(-10, -8.5, -9.8, -13.5, -7.2, -16.2);
-  ctx.quadraticCurveTo(-5.6, -20, 0, -20);
-  ctx.closePath();
 }
 
 /**

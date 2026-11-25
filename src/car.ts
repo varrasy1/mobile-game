@@ -26,6 +26,8 @@ export class Car {
   steer = 0;
   vForward = BASE_SPEED;
   vLateral = 0;
+  /** Extra turn authority from the selected car's handling stat (rad/s). */
+  handling = 0;
 
   get speed(): number {
     return Math.hypot(this.vx, this.vy);
@@ -33,7 +35,7 @@ export class Car {
 
   get turnRate(): number {
     const hi = Math.min(1, Math.max(0, (this.speed - BASE_SPEED) / (TOP_SPEED - BASE_SPEED)));
-    return 2.85 - 0.1 * hi; // slightly gentler at top speed, still enough for the tightest bend
+    return 2.85 + this.handling - 0.1 * hi; // slightly gentler at top speed, still enough for the tightest bend
   }
 
   update(dt: number, steerInput: number, targetSpeed: number): void {
