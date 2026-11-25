@@ -719,6 +719,18 @@ export class Renderer {
       my[i] = n.y;
     }
 
+    // Run-off: a soft gravel band beyond the edges marks the real track limit.
+    // (A wide round-joined stroke along the centre line never folds in corners.)
+    ctx.save();
+    ctx.strokeStyle = css(pal.road, 0.34);
+    ctx.lineWidth = (hw + 40) * 2;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    spline(ctx, mx, my, true, false);
+    ctx.stroke();
+    ctx.restore();
+
     // Ribbon with soft ambient drop shadow (shadow params are in device px).
     ctx.save();
     ctx.shadowColor = css(pal.roadShadow);

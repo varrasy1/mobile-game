@@ -10,7 +10,7 @@
  */
 
 export const NODE_SPACING = 14;
-export const ROAD_HALF_WIDTH = 68;
+export const ROAD_HALF_WIDTH = 84;
 export const NODES_AHEAD = 260;
 export const PRUNE_BEHIND = 450;
 

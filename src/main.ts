@@ -41,11 +41,13 @@ const DRIFT_GRIP = 3.6;
 /** Slip angle (deg) that counts as a drift. */
 const DRIFT_SLIP = 12;
 /** Heading snap on release: straightens small misalignments (deg). */
-const SNAP_DEG = 9;
+const SNAP_DEG = 16;
 /** Wall contact starts here (car centre to road centre, px) … */
-const WALL_TOUCH = 58;
+const WALL_TOUCH = 88;
 /** … and beyond this the car is off the course: crash. */
-const WALL_CRASH = 80;
+const WALL_CRASH = 124;
+/** Seconds in the gravel before the combo is lost. */
+const GRAVEL_GRACE = 0.35;
 const START_SPEED = 300;
 const ZONE_SPEED = 40;
 const PERFECT_DIST = 15;
@@ -144,6 +146,7 @@ let runTime = 0;
 let score = 0;
 let combo = 1;
 let wallT = 0;
+let gravelT = 0;
 let crashed = false;
 let nextCorner = 0;
 let sector = 0;
@@ -528,6 +531,7 @@ function startRun(): void {
   bonus = distPts = score = 0;
   combo = 1;
   wallT = 0;
+  gravelT = 0;
   crashed = false;
   nextCorner = 0;
   sector = 0;
@@ -1067,13 +1071,13 @@ function step(now: number): void {
     steer = cmd;
     const g = LATERAL_GRIP + gripBonus;
     const target = Math.abs(cmd) > 0.05 ? g + (DRIFT_GRIP + gripBonus * 0.4 - g) * Math.min(1, Math.abs(cmd)) : g;
-    car.grip += (target - car.grip) * Math.min(1, dt * (Math.abs(cmd) > 0.05 ? 12 : 5));
+    car.grip += (target - car.grip) * Math.min(1, dt * (Math.abs(cmd) > 0.05 ? 12 : 9));
     if (Math.abs(cmd) <= 0.05) {
       // Small heading snap on release so a nearly-straight exit becomes straight.
       const p = track.poseAt(q.s + 40);
       if (p) {
         const err = wrapAngle(p.angle - car.angle);
-        if (Math.abs(err) < (SNAP_DEG * Math.PI) / 180) car.angle += err * Math.min(1, dt * 6);
+        if (Math.abs(err) < (SNAP_DEG * Math.PI) / 180) car.angle += err * Math.min(1, dt * 9);
       }
     }
   }
@@ -1130,26 +1134,37 @@ function step(now: number): void {
   if (playing) {
     runTime += dt;
 
-    // Walls: scraping costs the combo, leaving the course ends the run.
+    // Track limits: wheels over the edge are fine; the gravel slows you and
+    // costs the combo only if you stay in it; beyond the gravel you crash.
     if (lat > WALL_CRASH) crashOut();
     else if (lat > WALL_TOUCH) {
-      if (wallT <= 0) {
+      gravelT += dt;
+      if (gravelT > GRAVEL_GRACE && wallT <= 0) {
         combo = 1;
-        renderer.popup(car.x, car.y - 24, 'WALL', false, 12);
+        renderer.popup(car.x, car.y - 24, 'OFF TRACK', false, 12);
         audio.crash();
         navigator.vibrate?.(20);
       }
-      wallT = 0.25;
-      if (Math.random() < 0.6) renderer.spawnSparks(car.x, car.y, car.vx * 0.3, car.vy * 0.3, 2);
-      // Lean the car back off the barrier.
+      if (gravelT > GRAVEL_GRACE) wallT = 0.25;
+      // The gravel bank leans you back toward the asphalt.
       const p = track.poseAt(q.s);
       if (p) {
-        const push = (lat - WALL_TOUCH) * 9 * dt * Math.sign(q.lateral);
+        const push = (40 + (lat - WALL_TOUCH) * 7) * dt * Math.sign(q.lateral);
         car.vx -= p.nx * push;
         car.vy -= p.ny * push;
       }
-    }
+    } else gravelT = 0;
     wallT = Math.max(0, wallT - dt);
+
+    // Soft edge guard: close to the edge and heading out, ease the nose back in.
+    if (lat > track.halfWidth - 14 && Math.abs(input.steer) < 0.05) {
+      const p = track.poseAt(q.s + 30);
+      if (p) {
+        const out = Math.sign(q.lateral);
+        const heading = wrapAngle(Math.atan2(car.vy, car.vx) - p.angle);
+        if (heading * out > 0) car.angle -= out * Math.min(0.9 * dt, heading * out * dt * 4);
+      }
+    }
 
     if (state === 'PLAYING') {
       updateDrift(dt, lat <= WALL_TOUCH);

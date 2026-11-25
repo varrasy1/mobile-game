@@ -6,7 +6,7 @@ export const MAX_SPEED = 460;
 export const TOP_SPEED = 520;
 
 const STEER_SMOOTHING = 14;
-export const LATERAL_GRIP = 5.2;
+export const LATERAL_GRIP = 6.2;
 const FORWARD_ACCEL = 2.4;
 
 /**
@@ -121,8 +121,8 @@ const DRAG_RANGE = 54;
 /** Movement that turns a hold into a drag. */
 const DRAG_THRESHOLD = 12;
 /** Hold steering ramps from a gentle nudge to full lock over this time. */
-const HOLD_RAMP_S = 0.32;
-const HOLD_MIN = 0.32;
+const HOLD_RAMP_S = 0.2;
+const HOLD_MIN = 0.45;
 
 interface Pointer {
   startX: number;

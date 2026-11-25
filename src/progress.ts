@@ -46,7 +46,7 @@ const TEMPLATES: Template[] = [
   { stat: 'perfects', goals: [2, 4, 7, 10, 15], text: (n) => `${n} PERFECT corners` },
   { stat: 'sector', goals: [2, 3, 4, 5, 6, 8], text: (n) => `Reach zone ${n}` },
   { stat: 'bestDrift', goals: [800, 1600, 3000, 5000, 8000], text: (n) => `Bank a ${fmt(n)} drift` },
-  { stat: 'score', goals: [15000, 40000, 90000, 180000, 350000], text: (n) => `Score ${fmt(n)} in one run` },
+  { stat: 'score', goals: [40000, 120000, 300000, 700000, 1500000], text: (n) => `Score ${fmt(n)} in one run` },
   { stat: 'nitros', goals: [1, 3, 5, 8], text: (n) => `Fire nitro ${n}×` },
   { stat: 'insane', goals: [1, 2, 4, 7], text: (n) => `Pull ${n} INSANE drift${n > 1 ? 's' : ''}` },
   { stat: 'chains', goals: [1, 3, 5, 8, 12], text: (n) => `Complete ${n} light chain${n > 1 ? 's' : ''}` },
@@ -218,7 +218,7 @@ export class Progress {
   /** End of run: grant XP + coins, roll completed missions. Returns levels gained. */
   finishRun(run: RunStats): { xpGained: number; levelsGained: number; levelCoins: number } {
     const before = this.level;
-    const xpGained = Math.floor(run.score / 80);
+    const xpGained = Math.floor(Math.sqrt(Math.max(0, run.score)) * 4);
     this.xp += xpGained;
     this.coins += run.coins;
     const after = this.level;
