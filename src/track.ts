@@ -16,8 +16,6 @@ export const PRUNE_BEHIND = 450;
 
 const HEADING_LIMIT = 0.44 * Math.PI;
 const HEADING_SOFT = 0.38 * Math.PI;
-const APEX_CURVATURE = 0.0016;
-const APEX_MIN_GAP = 380;
 const APEX_HALF_NODES = 4; // 9 nodes → 8 × 14 = 112px ≈ 110px span
 export const APEX_INSET = 7;
 
@@ -176,13 +174,23 @@ function propSize(kind: PropKind, r: number): number {
 interface Pending {
   s: number;
   lat: number;
-  kind: 'orb' | 'pad' | 'power';
+  kind: 'orb' | 'pad' | 'power' | 'apex';
   idx: number;
 }
 
 const SCENERY_LAG_NODES = 150;
 
-type SegmentType = 'sweep' | 'scurve' | 'straight';
+type SegmentType = 'sweep' | 'corner' | 'straight';
+
+/** Ramp length (px) at each end of a corner, for smooth curvature build-up. */
+const CORNER_RAMP = 56;
+
+export interface Corner {
+  s0: number;
+  s1: number;
+  /** +1 = turns right, −1 = left. */
+  side: number;
+}
 
 interface Segment {
   type: SegmentType;
@@ -206,6 +214,7 @@ function mulberry32(seed: number): () => number {
 export class Track {
   readonly nodes: TrackNode[] = [];
   readonly apexes: ApexZone[] = [];
+  readonly corners: Corner[] = [];
   readonly orbs: Orb[] = [];
   readonly pads: BoostPad[] = [];
   readonly props: Prop[] = [];
@@ -258,6 +267,9 @@ export class Track {
     pruneBefore(this.orbs, cut);
     pruneBefore(this.pads, cut);
     pruneBefore(this.powerups, cut);
+    let cd = 0;
+    while (cd < this.corners.length && this.corners[cd].s1 < this.firstS) cd++;
+    if (cd > 0) this.corners.splice(0, cd);
     pruneBefore(this.props, this.firstS - 600);
   }
 
@@ -266,42 +278,46 @@ export class Track {
   private nextSegment(): void {
     const r = this.rng;
     const h = this.heading;
+    const here = this.lastS;
+    const prev = this.lastType;
     let type: SegmentType;
     const roll = r();
-    if (this.lastType === 'straight') type = roll < 0.62 ? 'sweep' : 'scurve';
-    else type = roll < 0.5 ? 'sweep' : roll < 0.8 ? 'scurve' : 'straight';
+    if (prev === 'corner') type = roll < 0.55 ? 'straight' : roll < 0.85 ? 'corner' : 'sweep';
+    else type = roll < 0.8 ? 'corner' : 'sweep';
+    // Gentle opening: the first stretch flows before the real corners start.
+    if (here < 1400) type = 'sweep';
 
-    let L = type === 'straight' ? 450 + r() * 250 : 450 + r() * 500;
+    let L = 0;
     let K = 0;
-
-    // Prefer bending back toward "up" once the road leans far to one side.
-    const towardCentre = Math.abs(h) > 0.16 * Math.PI && r() < 0.85;
+    const towardCentre = Math.abs(h) > 0.12 * Math.PI && r() < 0.85;
     let sign = towardCentre ? -Math.sign(h) : r() < 0.5 ? -1 : 1;
+    // Chicanes: a corner straight after a corner flips direction.
+    if (type === 'corner' && prev === 'corner') sign = -Math.sign(this.seg.K) || sign;
 
-    if (type === 'sweep') {
-      K = 0.0019 + r() * 0.0023;
-      // Net heading change of a sin-profile sweep: K·L·2/π
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const room = sign > 0 ? HEADING_SOFT - h : h + HEADING_SOFT;
-        const maxK = (Math.max(0, room) * Math.PI) / (2 * L);
-        if (maxK >= 0.0017) {
-          K = Math.min(K, maxK);
-          break;
-        }
-        sign = -sign;
-      }
-    } else if (type === 'scurve') {
-      K = 0.0018 + r() * 0.0022;
-      // Peak excursion of a full-sine S-curve: K·L/π (in the first lobe's direction)
+    if (type === 'straight') {
+      L = 200 + r() * 320;
+    } else if (type === 'sweep') {
+      L = 420 + r() * 380;
+      K = 0.0018 + r() * 0.0016;
       const room = sign > 0 ? HEADING_SOFT - h : h + HEADING_SOFT;
-      if ((K * L) / Math.PI > room) {
+      const maxK = (Math.max(0, room) * Math.PI) / (2 * L);
+      if (maxK < 0.0012) sign = -sign;
+      K = Math.min(K, (Math.max(0, sign > 0 ? HEADING_SOFT - h : h + HEADING_SOFT) * Math.PI) / (2 * L));
+    } else {
+      const early = Math.min(1, Math.max(0, (here - 1400) / 6000));
+      K = 0.0045 + r() * (0.0015 + 0.0018 * early);
+      let turn = (0.3 + r() * (0.25 + 0.2 * early)) * Math.PI;
+      const limit = 0.42 * Math.PI;
+      let room = sign > 0 ? limit - h : h + limit;
+      if (room < 0.22 * Math.PI) {
         sign = -sign;
-        const room2 = sign > 0 ? HEADING_SOFT - h : h + HEADING_SOFT;
-        K = Math.min(K, (Math.max(0, room2) * Math.PI) / L);
+        room = sign > 0 ? limit - h : h + limit;
       }
-      if (K < 0.0012) {
+      turn = Math.min(turn, room);
+      L = turn / K + CORNER_RAMP;
+      if (L < CORNER_RAMP * 2 + 30) {
         type = 'straight';
-        L = 500;
+        L = 260;
         K = 0;
       }
     }
@@ -309,18 +325,37 @@ export class Track {
     this.lastType = type;
     this.seg = { type, K: K * sign, L, pos: 0 };
 
-    // Boost pads on straights (and the odd sweep entry).
-    const here = this.lastS;
-    if (here > 1800 && ((type === 'straight' && r() < 0.75) || (type === 'sweep' && r() < 0.18))) {
-      this.pending.push({ s: here + L * (type === 'straight' ? 0.4 : 0.08), lat: (r() - 0.5) * 56, kind: 'pad', idx: 0 });
+    if (type === 'corner') {
+      const mid = here + L / 2;
+      this.corners.push({ s0: here, s1: here + L, side: sign });
+      if (mid - this.lastApexS > 240) {
+        this.lastApexS = mid;
+        this.pending.push({ s: mid, lat: 0, kind: 'apex', idx: sign });
+        // Light chain on the drift line: outside → inside at the apex → outside.
+        const span = L / 2 + 110;
+        let idx = 0;
+        for (let d = -span; d <= span * 0.55; d += 30) {
+          const u = d / span;
+          const bell = Math.exp(-u * u * 3.2);
+          this.pending.push({ s: mid + d, lat: sign * (-34 + 82 * bell), kind: 'orb', idx: idx++ });
+        }
+      }
+    }
+
+    // Boost pads on straights.
+    if (here > 1800 && type === 'straight' && L > 300 && r() < 0.55) {
+      this.pending.push({ s: here + L * 0.35, lat: (r() - 0.5) * 56, kind: 'pad', idx: 0 });
     }
   }
 
   private curvatureAtSegment(): number {
     const { type, K, L, pos } = this.seg;
-    const u = pos / L;
-    if (type === 'sweep') return K * Math.sin(Math.PI * u);
-    if (type === 'scurve') return K * Math.sin(2 * Math.PI * u);
+    if (type === 'sweep') return K * Math.sin((Math.PI * pos) / L);
+    if (type === 'corner') {
+      const e = Math.min(1, pos / CORNER_RAMP, (L - pos) / CORNER_RAMP);
+      const t = Math.max(0, e);
+      return K * t * t * (3 - 2 * t);
+    }
     return 0;
   }
 
@@ -342,7 +377,6 @@ export class Track {
       ny: Math.sin(this.heading),
     };
     this.nodes.push(node);
-    this.detectApex();
     if (node.s > this.nextPowerS) {
       const r = this.rng;
       const lanes = [-36, 0, 36];
@@ -360,8 +394,13 @@ export class Track {
     const limit = this.lastS - 2 * NODE_SPACING;
     for (let i = 0; i < this.pending.length; ) {
       const p = this.pending[i];
-      if (p.s > limit) {
+      if (p.s > limit - (p.kind === 'apex' ? 6 * NODE_SPACING : 0)) {
         i++;
+        continue;
+      }
+      if (p.kind === 'apex') {
+        this.pending.splice(i, 1);
+        this.makeApex(Math.round((p.s - this.nodes[0].s) / NODE_SPACING), p.idx);
         continue;
       }
       this.pending.splice(i, 1);
@@ -450,20 +489,11 @@ export class Track {
     return Math.sqrt(best);
   }
 
-  /** Lagged peak detection so the full ±55px arc already exists. */
-  private detectApex(): void {
+  /** Builds an apex zone on the inside edge around node i. */
+  private makeApex(i: number, side: number): void {
     const n = this.nodes;
-    const i = n.length - 1 - (APEX_HALF_NODES + 1);
-    if (i < APEX_HALF_NODES) return;
-    const a = Math.abs(n[i - 1].k);
-    const b = Math.abs(n[i].k);
-    const c = Math.abs(n[i + 1].k);
-    if (b <= APEX_CURVATURE || b < a || b <= c) return;
+    if (i < APEX_HALF_NODES || i + APEX_HALF_NODES >= n.length) return;
     const node = n[i];
-    if (node.s - this.lastApexS < APEX_MIN_GAP || node.s < 600) return;
-    this.lastApexS = node.s;
-
-    const side = Math.sign(node.k);
     const off = side * (ROAD_HALF_WIDTH - APEX_INSET);
     const pts: number[] = [];
     for (let j = i - APEX_HALF_NODES; j <= i + APEX_HALF_NODES; j++) {
@@ -484,15 +514,6 @@ export class Track {
       fade: -1,
       best: Infinity,
     });
-
-    // Orb chain tracing the racing line: outside → apex → outside.
-    let idx = 0;
-    for (let d = -230; d <= 90; d += 32) {
-      const u = d / 170;
-      const bell = Math.exp(-u * u * 2.2);
-      const lat = side * (-26 * (1 - bell) + 46 * bell);
-      this.pending.push({ s: node.s + d, lat, kind: 'orb', idx: idx++ });
-    }
   }
 
   // ───────────────────────── queries ─────────────────────────

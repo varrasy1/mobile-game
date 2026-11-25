@@ -6,7 +6,7 @@ export const MAX_SPEED = 460;
 export const TOP_SPEED = 520;
 
 const STEER_SMOOTHING = 14;
-const LATERAL_GRIP = 5.2;
+export const LATERAL_GRIP = 5.2;
 const FORWARD_ACCEL = 2.4;
 
 /**
@@ -28,6 +28,8 @@ export class Car {
   vLateral = 0;
   /** Extra turn authority from the selected car's handling stat (rad/s). */
   handling = 0;
+  /** Lateral grip (1/s). Lowered while the player holds a drift. */
+  grip = LATERAL_GRIP;
 
   get speed(): number {
     return Math.hypot(this.vx, this.vy);
@@ -50,7 +52,7 @@ export class Car {
     let vF = this.vx * fx + this.vy * fy;
     let vL = this.vx * rx + this.vy * ry;
     vF += (targetSpeed - vF) * (1 - Math.exp(-FORWARD_ACCEL * dt));
-    vL *= Math.exp(-LATERAL_GRIP * dt);
+    vL *= Math.exp(-this.grip * dt);
 
     this.vx = fx * vF + rx * vL;
     this.vy = fy * vF + ry * vL;

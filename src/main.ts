@@ -1,5 +1,5 @@
 import { AudioEngine } from './audio';
-import { BASE_SPEED, Car, InputController, TOP_SPEED, autopilotSteer, followSteer } from './car';
+import { BASE_SPEED, Car, InputController, LATERAL_GRIP, TOP_SPEED, autopilotSteer, followSteer } from './car';
 import { CARS, carById, drawCar as drawCarModel, type CarModel } from './cars';
 import {
   PAINTS,
@@ -38,7 +38,14 @@ type GameState = 'TITLE' | 'PLAYING' | 'ENDING' | 'RESULTS';
 // ───────────────────────── tuning ─────────────────────────
 
 const SECTOR_LENGTH = ZONE_LENGTH; // px → 1.5 km between checkpoints / world zones
-const LANE_OVERHANG = 26;
+/** Grip while the player holds full steering (the tail lets go). */
+const DRIFT_GRIP = 3.8;
+/** Extra rotation a full hold adds on top of following the road (simulation-tuned). */
+const HOLD_GAIN = 0.3;
+/** Max steering the lane-keeping assist may use: enough for sweeps, not corners. */
+const ASSIST_MAX = 0.42;
+/** Slip angle (deg) that counts as a drift. */
+const DRIFT_SLIP = 12;
 const START_TIME = 30;
 const MAX_TIME = 60;
 const OFFROAD_DRAIN = 0.6; // extra seconds per second off the asphalt
@@ -107,7 +114,7 @@ const traffic = new Traffic({ styles: TRAFFIC_STYLES, paints: TRAFFIC_PAINTS });
 
 let model: CarModel = carById(progress.selected);
 let speedBonus = 0;
-let laneSpeed = 240;
+let gripBonus = 0;
 let nitroFactor = 1;
 
 /** Factory stats plus garage tuning. */
@@ -125,7 +132,7 @@ function applyModel(m: CarModel): void {
   const st = effectiveStats(m);
   renderer.setModel(m, paintById(progress.tune(m.id).paint)?.hex ?? null);
   speedBonus = (st.speed - 2) * 14;
-  laneSpeed = 220 + (st.handling - 2) * 28;
+  gripBonus = (st.handling - 2) * 0.35;
   car.handling = (st.handling - 2) * 0.12;
   nitroFactor = 0.8 + st.nitro * 0.12;
 }
@@ -157,12 +164,13 @@ let lastTick = 0;
 
 // Drift + nitro
 let drifting = false;
-let driftSide = 0;
+let releaseT = 1;
+let driftChain = 0;
+let chainWindow = 0;
 let driftT = 0;
 let driftPts = 0;
 let driftTier = 0;
-let driftGrace = 0;
-let driftRelease = 0;
+let driftCalm = 0;
 let driftAngle = 0;
 let nitro = 0; // charge 0…1
 let nitroT = 0; // seconds of burn left
@@ -841,51 +849,54 @@ function endDrift(clean: boolean): void {
       addTime(T_DRIFT[driftTier]);
       run.bestDrift = Math.max(run.bestDrift, pts);
       if (driftTier === 3) run.insane++;
-      showDrift(`${DRIFT_NAMES[driftTier]} +${fmt(pts)}`);
+      chainWindow = 1.3;
+      showDrift(`${DRIFT_NAMES[driftTier]}${driftChain > 0 ? ` ×${driftChain + 1}` : ''} +${fmt(pts)}`);
       audio.blip(5 + driftTier * 2, 0.06);
       navigator.vibrate?.(10);
     } else {
       showDrift('DRIFT LOST');
+      driftChain = 0;
+      chainWindow = 0;
     }
   } else hideDrift();
   driftT = driftPts = 0;
   driftTier = 0;
 }
 
-function updateDrift(dt: number, cmd: number, onRoad: boolean): void {
-  const kAhead = track.curvatureAt(q.s + car.speed * 0.15);
-  const bendSide = Math.abs(kAhead) > (drifting ? 0.0006 : 0.0011) ? Math.sign(kAhead) : 0;
+/** Drift = real slip: the car's facing and travel direction disagree. */
+function updateDrift(dt: number, onRoad: boolean): void {
+  const slipDeg = (Math.abs(Math.atan2(car.vLateral, Math.max(1, car.vForward))) * 180) / Math.PI;
+  chainWindow = Math.max(0, chainWindow - dt);
   if (!onRoad) {
     endDrift(false);
     return;
   }
   if (!drifting) {
-    if (bendSide !== 0 && cmd * bendSide > 0.25 && car.speed > 200) {
+    if (slipDeg > DRIFT_SLIP && car.speed > 150) {
       drifting = true;
-      driftSide = bendSide;
+      driftChain = chainWindow > 0 ? driftChain + 1 : 0;
       driftT = driftPts = 0;
       driftTier = 0;
-      driftGrace = driftRelease = 0;
+      driftCalm = 0;
     }
     return;
   }
-  // Keep drifting while held into the bend; brief straights are forgiven.
-  driftGrace = bendSide === driftSide ? 0 : driftGrace + dt;
-  driftRelease = cmd * driftSide > 0.1 ? 0 : driftRelease + dt;
-  if (driftGrace > 0.45 || driftRelease > 0.12) {
+  driftCalm = slipDeg < DRIFT_SLIP * 0.6 ? driftCalm + dt : 0;
+  if (driftCalm > 0.22) {
     endDrift(true);
     return;
   }
   driftT += dt;
   const tier = driftT >= DRIFT_TIERS[2] ? 3 : driftT >= DRIFT_TIERS[1] ? 2 : driftT >= DRIFT_TIERS[0] ? 1 : 0;
-  driftPts += 220 * Math.max(1, tier) * (1 + streak * 0.1) * dt;
-  if (driftT > 0.4) nitro = Math.min(1, nitro + 0.2 * nitroFactor * dt);
+  const angleFactor = Math.min(2, slipDeg / 25);
+  driftPts += 160 * angleFactor * Math.max(1, tier) * (1 + driftChain * 0.5) * (1 + streak * 0.1) * dt;
+  if (driftT > 0.3) nitro = Math.min(1, nitro + 0.22 * nitroFactor * dt);
   if (tier > driftTier) {
     driftTier = tier;
     audio.blip(3 + tier * 2, 0.05);
     if (tier === 3) renderer.kick(0.25);
   }
-  if (tier > 0) showDrift(`${DRIFT_NAMES[tier]} ${fmt(driftPts)}`, true);
+  if (tier > 0) showDrift(`${DRIFT_NAMES[tier]}${driftChain > 0 ? ` ×${driftChain + 1}` : ''} ${fmt(driftPts)}`, true);
 }
 
 // ── Traffic: close calls, crashes, nitro takedowns ──
@@ -1068,27 +1079,37 @@ function step(now: number): void {
   const onRoadBefore = Math.abs(q.lateral) <= track.halfWidth;
 
   let steer: number;
-  let cmd = 0;
   if (!playing || debugAutopilot) {
     steer = autopilotSteer(car, track, q);
     lane = q.lateral;
+    car.grip = LATERAL_GRIP;
   } else {
-    cmd = input.steer;
+    let cmd = input.steer;
     if (import.meta.env.DEV) {
       const bot = (window as { __botSteer?: () => number }).__botSteer;
       if (bot) cmd = bot();
     }
-    const limit = track.halfWidth + LANE_OVERHANG;
-    if (drifting) {
-      // Holding into the bend: slide toward the inside edge (where the apex
-      // lives) but never past it, so a held drift can't spill off the road.
-      const inner = (track.halfWidth - 12) * driftSide;
-      const towardInside = cmd * driftSide > 0;
-      lane += cmd * laneSpeed * 0.45 * dt;
-      if (towardInside) lane = driftSide > 0 ? Math.min(lane, inner) : Math.max(lane, inner);
-      lane = Math.max(-limit, Math.min(limit, lane));
-    } else lane = Math.max(-limit, Math.min(limit, lane + cmd * laneSpeed * dt));
-    steer = followSteer(car, track, q, lane);
+    const holdLimit = track.halfWidth - 14;
+    if (Math.abs(cmd) > 0.04) {
+      // Holding: the car follows the road's curvature and the hold adds extra
+      // rotation — the tail steps out. Too long pulls you inside, too short
+      // and the corner pushes you wide.
+      const ff = (track.curvatureAt(q.s + car.speed * 0.1) * car.speed) / car.turnRate;
+      steer = ff * cmd > 0 ? Math.max(-1, Math.min(1, ff + cmd * HOLD_GAIN)) : cmd;
+      const g = LATERAL_GRIP + gripBonus;
+      const target = g + (DRIFT_GRIP + gripBonus * 0.4 - g) * Math.min(1, Math.abs(cmd));
+      car.grip += (target - car.grip) * Math.min(1, dt * 10);
+      releaseT = 0;
+      lane = Math.max(-holdLimit, Math.min(holdLimit, q.lateral));
+    } else {
+      // Hands off: catch the slide, then keep the current line. The assist is
+      // only strong enough for sweeps; real corners need a drift.
+      releaseT += dt;
+      car.grip += (LATERAL_GRIP + gripBonus - car.grip) * Math.min(1, dt * 5);
+      if (releaseT < 0.12) lane = Math.max(-holdLimit, Math.min(holdLimit, q.lateral));
+      const authority = releaseT < 0.35 ? 0.8 : ASSIST_MAX;
+      steer = Math.max(-authority, Math.min(authority, followSteer(car, track, q, lane)));
+    }
   }
 
   boostT = Math.max(0, boostT - dt);
@@ -1097,12 +1118,13 @@ function step(now: number): void {
   const nitroAmt = nitroT > 0 ? Math.min(1, nitroT / 0.4, 0.6 + 0.4 * (nitroT / nitroDur)) : 0;
   let target: number;
   if (state === 'ENDING' || state === 'RESULTS') target = 150;
+  else if (state === 'TITLE') target = 230;
   else
     target =
       Math.min(TOP_SPEED + speedBonus, BASE_SPEED + speedBonus + streak * 12 + sector * 22) +
       BOOST_SPEED * boostAmt +
       (nitroT > 0 ? NITRO_SPEED : 0);
-  if (drifting) target *= 0.97;
+  if (drifting) target *= 1 - 0.15 * Math.min(1, Math.abs(car.vLateral) / Math.max(1, car.speed) / 0.6);
   if (!onRoadBefore) target *= 0.72;
   car.update(dt, steer, target);
 
@@ -1145,7 +1167,7 @@ function step(now: number): void {
   if (playing) {
     runTime += dt;
     if (!onRoad) breakStreak();
-    updateDrift(dt, cmd, onRoad);
+    updateDrift(dt, onRoad);
 
     if (q.s > maxS) {
       distPts += ((q.s - maxS) / 10) * (nitroT > 0 ? 2 : 1);
@@ -1200,14 +1222,15 @@ function step(now: number): void {
   }
 
   // Drift visuals: tail swings out toward the outside of the bend.
-  const driftTarget = drifting ? driftSide * (0.42 + 0.22 * Math.min(1, Math.abs(track.curvatureAt(q.s)) / 0.004)) : 0;
+  const driftTarget = 0;
   driftAngle += (driftTarget - driftAngle) * (1 - Math.exp(-7 * dt));
 
   // Effects
   const slip = Math.abs(car.vLateral);
   const visualSlip = slip + Math.abs(driftAngle) * 140;
   renderer.addTrail(car, onRoad && visualSlip > 24, time, driftAngle);
-  if (Math.abs(driftAngle) > 0.15 && onRoad) renderer.spawnSmoke(car, driftAngle, Math.min(1, Math.abs(driftAngle) * 1.6));
+  const slipDegFx = (Math.abs(Math.atan2(car.vLateral, Math.max(1, car.vForward))) * 180) / Math.PI;
+  if (onRoad && (slipDegFx > 13 || Math.abs(driftAngle) > 0.15)) renderer.spawnSmoke(car, driftAngle, Math.min(1, slipDegFx / 30 + Math.abs(driftAngle)));
   if (!onRoad && car.speed > 60) renderer.spawnDust(car);
   glow += ((visualSlip > 28 || boostAmt > 0.1 || nitroT > 0 ? 1 : 0) - glow) * (1 - Math.exp(-8 * dt));
   renderer.updateEffects(dt, time);
