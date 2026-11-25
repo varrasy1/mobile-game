@@ -41,7 +41,7 @@ const BOOST_TIME = 1.4;
 const BOOST_SPEED = 150;
 const NITRO_SPEED = 150;
 const NITRO_MIN = 0.25;
-const DRIFT_TIERS = [0.7, 1.5, 2.5]; // seconds → GOOD / GREAT / INSANE
+const DRIFT_TIERS = [0.5, 1.1, 1.8]; // seconds → GOOD / GREAT / INSANE
 const DRIFT_NAMES = ['', 'GOOD DRIFT', 'GREAT DRIFT', 'INSANE DRIFT'];
 const KMH = 0.6;
 
@@ -711,7 +711,7 @@ function endDrift(clean: boolean): void {
 
 function updateDrift(dt: number, cmd: number, onRoad: boolean): void {
   const kAhead = track.curvatureAt(q.s + car.speed * 0.15);
-  const bendSide = Math.abs(kAhead) > 0.0011 ? Math.sign(kAhead) : 0;
+  const bendSide = Math.abs(kAhead) > (drifting ? 0.0006 : 0.0011) ? Math.sign(kAhead) : 0;
   if (!onRoad) {
     endDrift(false);
     return;
@@ -729,14 +729,14 @@ function updateDrift(dt: number, cmd: number, onRoad: boolean): void {
   // Keep drifting while held into the bend; brief straights are forgiven.
   driftGrace = bendSide === driftSide ? 0 : driftGrace + dt;
   driftRelease = cmd * driftSide > 0.1 ? 0 : driftRelease + dt;
-  if (driftGrace > 0.35 || driftRelease > 0.12) {
+  if (driftGrace > 0.45 || driftRelease > 0.12) {
     endDrift(true);
     return;
   }
   driftT += dt;
   const tier = driftT >= DRIFT_TIERS[2] ? 3 : driftT >= DRIFT_TIERS[1] ? 2 : driftT >= DRIFT_TIERS[0] ? 1 : 0;
-  driftPts += 150 * Math.max(1, tier) * (1 + streak * 0.1) * dt;
-  nitro = Math.min(1, nitro + 0.32 * nitroFactor * dt);
+  driftPts += 220 * Math.max(1, tier) * (1 + streak * 0.1) * dt;
+  if (driftT > 0.4) nitro = Math.min(1, nitro + 0.2 * nitroFactor * dt);
   if (tier > driftTier) {
     driftTier = tier;
     audio.blip(3 + tier * 2, 0.05);
@@ -818,8 +818,15 @@ function step(now: number): void {
       if (bot) cmd = bot();
     }
     const limit = track.halfWidth + LANE_OVERHANG;
-    const rate = laneSpeed * (drifting ? 0.3 : 1);
-    lane = Math.max(-limit, Math.min(limit, lane + cmd * rate * dt));
+    if (drifting) {
+      // Holding into the bend: slide toward the inside edge (where the apex
+      // lives) but never past it, so a held drift can't spill off the road.
+      const inner = (track.halfWidth - 12) * driftSide;
+      const towardInside = cmd * driftSide > 0;
+      lane += cmd * laneSpeed * 0.45 * dt;
+      if (towardInside) lane = driftSide > 0 ? Math.min(lane, inner) : Math.max(lane, inner);
+      lane = Math.max(-limit, Math.min(limit, lane));
+    } else lane = Math.max(-limit, Math.min(limit, lane + cmd * laneSpeed * dt));
     steer = followSteer(car, track, q, lane);
   }
 
@@ -880,7 +887,7 @@ function step(now: number): void {
       navigator.vibrate?.([12, 50, 12]);
     }
 
-    timeLeft -= (1 + (onRoad ? 0 : OFFROAD_DRAIN)) * dt;
+    timeLeft -= (1 + sector * 0.08 + (onRoad ? 0 : OFFROAD_DRAIN)) * dt;
     if (timeLeft < 5.5 && Math.ceil(timeLeft) !== lastTick && timeLeft > 0) {
       lastTick = Math.ceil(timeLeft);
       audio.blip(-5, 0.05);

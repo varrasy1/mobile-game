@@ -208,6 +208,13 @@
         opacity: 1;
         transform: none;
       }
+      #results::before {
+        content: '';
+        position: absolute;
+        inset: -10%;
+        z-index: -1;
+        background: radial-gradient(ellipse 60% 48% at 50% 44%, color-mix(in srgb, var(--bg) 78%, transparent), transparent 75%);
+      }
       .r-label {
         font-size: 11px;
         letter-spacing: 0.4em;
@@ -318,7 +325,7 @@
         pointer-events: none;
         text-align: center;
         transition: opacity 400ms var(--ease);
-        padding-bottom: 12vh;
+        padding-bottom: 36vh;
       }
       #title.hidden {
         opacity: 0;

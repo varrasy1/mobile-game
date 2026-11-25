@@ -8,9 +8,11 @@ npm run dev        # local dev server
 npm run build      # typecheck + production build → dist/
 ```
 
-**Controls:** hold the left/right half of the screen (steering ramps in), or drag sideways for analogue control · `←/A` `→/D` on desktop. A light steering assist follows the road.
+**Controls:** hold the left/right half of the screen to shift your line (drag works too) · `←/A` `→/D` on desktop. Hold *into* a bend to throw the car into a drift. Tap **N₂O** (or `Space`) to fire nitro.
 
-**Loop:** your flow meter drains over time. Refill it by clipping apex arcs (PERFECT inside 12px), collecting light chains on the racing line, banking clean drifts, hitting boost pads and reaching new sectors (every 1.5 km). When flow runs dry the car eases off and the run is scored.
+**Loop (arcade):** the clock counts down. Buy time by clipping apex arcs (PERFECT inside 15px), completing light chains, banking drifts (GOOD → GREAT → INSANE) and reaching checkpoints every 1.5 km. Drifts charge nitro; nitro doubles points. Time runs out → results, XP and coins.
+
+**Progression:** player level (XP from score), coins (lights, chains, checkpoints, missions, level-ups), three rotating missions with escalating goals, and a garage of five cars (Aero, Vector, Apex, Torque, Zenith) with distinct speed / handling / nitro stats.
 
 ## Deploy (GitHub Pages)
 
