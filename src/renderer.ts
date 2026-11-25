@@ -619,6 +619,12 @@ export class Renderer {
     ctx.restore();
   }
 
+  private drawPaint(angle: number, pal: Palette): void {
+    // Dark-bodied car (light theme) gets the deeper black-lacquer treatment.
+    const dark = pal.carBody[0] < 128;
+    paintGloss(this.ctx, angle, pal, dark);
+  }
+
   private drawCar(car: Car, pal: Palette, glow: number): void {
     const { ctx } = this;
     ctx.save();
@@ -656,6 +662,7 @@ export class Renderer {
     ctx.fillStyle = css(pal.carBody);
     bodyPath(ctx);
     ctx.fill();
+    this.drawPaint(car.angle, pal);
 
     // Rear wing + diffuser detail.
     ctx.strokeStyle = css(pal.canopy, 0.28);
@@ -701,6 +708,58 @@ export class Renderer {
 
     ctx.restore();
   }
+}
+
+/**
+ * Glossy clear-coat: the light comes from a fixed world direction (top-left),
+ * so reflections glide across the body as the car turns.
+ */
+function paintGloss(ctx: CanvasRenderingContext2D, angle: number, pal: Palette, darkBody: boolean): void {
+  // World light direction expressed in the car's local frame.
+  const rot = -(angle + Math.PI / 2);
+  const wx = -0.62;
+  const wy = -0.78;
+  const lx = wx * Math.cos(rot) - wy * Math.sin(rot);
+  const ly = wx * Math.sin(rot) + wy * Math.cos(rot);
+
+  ctx.save();
+  bodyPath(ctx);
+  ctx.clip();
+
+  // Broad sheen across the body.
+  const g = ctx.createLinearGradient(lx * 22, ly * 22, -lx * 22, -ly * 22);
+  g.addColorStop(0, `rgba(255,255,255,${darkBody ? 0.32 : 0.55})`);
+  g.addColorStop(0.42, 'rgba(255,255,255,0)');
+  g.addColorStop(1, `rgba(0,0,0,${darkBody ? 0.35 : 0.16})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(-12, -22, 24, 44);
+
+  // Tight specular hot-spot on the lit shoulder.
+  const hx = lx * 6;
+  const hy = ly * 9;
+  const spec = ctx.createRadialGradient(hx, hy, 0, hx, hy, 9);
+  spec.addColorStop(0, `rgba(255,255,255,${darkBody ? 0.45 : 0.7})`);
+  spec.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = spec;
+  ctx.fillRect(hx - 9, hy - 9, 18, 18);
+
+  // Clear-coat rim on the lit edge.
+  ctx.strokeStyle = `rgba(255,255,255,${darkBody ? 0.28 : 0.4})`;
+  ctx.lineWidth = 0.8;
+  ctx.setLineDash([]);
+  ctx.translate(-lx * 0.7, -ly * 0.7);
+  bodyPath(ctx);
+  ctx.stroke();
+  ctx.restore();
+
+  // Accent pinstripe down the spine.
+  ctx.strokeStyle = css(pal.accent, 0.85);
+  ctx.lineWidth = 1.1;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -18.6);
+  ctx.lineTo(0, -8.6);
+  ctx.stroke();
 }
 
 /** Car silhouette, nose at −y, 20 × 40. */
