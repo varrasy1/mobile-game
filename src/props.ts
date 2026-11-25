@@ -650,6 +650,8 @@ interface BuildingGeo {
   wallsB: Path2D[];
   roofs: Path2D[];
   roofInner: Path2D[];
+  /** Big rect minus the upper block's silhouette (evenodd clip for the light pass). */
+  cover: Path2D | null;
   detailShadow: Path2D;
   detail: Path2D;
   detailTop: Path2D;
@@ -747,6 +749,14 @@ function buildingGeo(v: number): BuildingGeo {
     ri.rect(b.x0 + inset, b.y0 + inset, b.x1 - b.x0 - inset * 2, b.y1 - b.y0 - inset * 2);
     roofInner.push(ri);
   }
+  let cover: Path2D | null = null;
+  const top = blocks[blocks.length - 1]!;
+  if (blocks.length > 1) {
+    cover = new Path2D();
+    cover.rect(-4, -4, 8, 8);
+    const s = top.h;
+    rectPoly(cover, [top.x0, top.y0, top.x1, top.y0, top.x1 + s, top.y0 + s, top.x1 + s, top.y1 + s, top.x0 + s, top.y1 + s, top.x0, top.y1]);
+  }
   const detailShadow = new Path2D();
   const detail = new Path2D();
   const detailTop = new Path2D();
@@ -776,7 +786,7 @@ function buildingGeo(v: number): BuildingGeo {
       }
     }
   }
-  g = { blocks, ground, wallsR, wallsB, roofs, roofInner, detailShadow, detail, detailTop, detailDark };
+  g = { blocks, ground, wallsR, wallsB, roofs, roofInner, cover, detailShadow, detail, detailTop, detailDark };
   buildingCache[v] = g;
   return g;
 }
@@ -1404,6 +1414,11 @@ export function drawPropLight(
     const win = WIN_LEN / r;
     const h0 = Math.floor(seed * 9973);
     for (let bi = 0; bi < g.blocks.length; bi++) {
+      const occluded = g.cover !== null && bi < g.blocks.length - 1;
+      if (occluded) {
+        ctx.save();
+        ctx.clip(g.cover!, 'evenodd');
+      }
       windowLines(g.blocks[bi]!, r, (x0, y0, x1, y1, lw, floor, face) => {
         const hsh = (h0 + floor * 7 + face * 13 + bi * 29) % 97;
         const pi = hsh % LIT_PATTERNS.length;
@@ -1416,6 +1431,7 @@ export function drawPropLight(
         ctx.lineTo(x1, y1);
         ctx.stroke();
       });
+      if (occluded) ctx.restore();
     }
     ctx.restore();
   }

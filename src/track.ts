@@ -453,7 +453,7 @@ export class Track {
         y: node.y + node.ny * lat,
         s,
         kind: 'lamp',
-        r: 6,
+        r: 8,
         seed: r(),
         angle: Math.atan2(-node.ny * side, -node.nx * side),
       });
