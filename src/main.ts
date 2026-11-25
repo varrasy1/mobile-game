@@ -46,7 +46,7 @@ const HOLD_GAIN = 0.3;
 const ASSIST_MAX = 0.42;
 /** Slip angle (deg) that counts as a drift. */
 const DRIFT_SLIP = 12;
-const START_TIME = 30;
+const START_TIME = 35;
 const MAX_TIME = 60;
 const OFFROAD_DRAIN = 0.6; // extra seconds per second off the asphalt
 const T_APEX = 0.8;
@@ -919,7 +919,9 @@ function takedown(c: TrafficCar, dl: number, label: string): void {
   navigator.vibrate?.([30, 30, 40]);
 }
 
+let crashCount = 0;
 function crash(c: TrafficCar, dl: number): void {
+  crashCount++;
   invulnT = 1.3;
   car.vx *= 0.42;
   car.vy *= 0.42;
@@ -1041,6 +1043,7 @@ if (import.meta.env.DEV) {
           run,
           shieldT,
           magnetT,
+          crashes: crashCount,
           samples: recording.length / 3,
         };
       },
@@ -1095,7 +1098,9 @@ function step(now: number): void {
       // rotation — the tail steps out. Too long pulls you inside, too short
       // and the corner pushes you wide.
       const ff = (track.curvatureAt(q.s + car.speed * 0.1) * car.speed) / car.turnRate;
-      steer = ff * cmd > 0 ? Math.max(-1, Math.min(1, ff + cmd * HOLD_GAIN)) : cmd;
+      if (ff * cmd > 0) steer = Math.max(-1, Math.min(1, ff + cmd * HOLD_GAIN));
+      // On straights a hold is a lane change, so it steers gently.
+      else steer = cmd * (Math.abs(ff) < 0.15 ? 0.45 : 1);
       const g = LATERAL_GRIP + gripBonus;
       const target = g + (DRIFT_GRIP + gripBonus * 0.4 - g) * Math.min(1, Math.abs(cmd));
       car.grip += (target - car.grip) * Math.min(1, dt * 10);

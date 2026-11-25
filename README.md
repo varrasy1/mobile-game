@@ -8,11 +8,13 @@ npm run dev        # local dev server
 npm run build      # typecheck + production build → dist/
 ```
 
-**Controls:** hold the left/right half of the screen to shift your line (drag works too) · `←/A` `→/D` on desktop. Hold *into* a bend to throw the car into a drift. Tap **N₂O** (or `Space`) to fire nitro.
+**Controls:** hold **into** a corner to drift (left/right half of the screen, or drag) — the car follows the bend while the tail steps out; release to catch it. Hands off, a lane assist keeps your line but can't take real corners. A short hold on a straight changes lanes. **N₂O** (or `Space`) fires nitro. Desktop: `←/A` `→/D`.
 
-**Loop (arcade):** the clock counts down. Buy time by clipping apex arcs (PERFECT inside 15px), completing light chains, banking drifts (GOOD → GREAT → INSANE) and reaching checkpoints every 1.5 km. Drifts charge nitro; nitro doubles points. Time runs out → results, XP and coins.
+**Loop (arcade):** the clock counts down; checkpoints every 1 km add time. Earn time and points with drifts (GOOD → GREAT → INSANE, chained drifts multiply), PERFECT apexes, light chains, close calls in traffic and power-ups (magnet, shield, +time, 2×). Crashing costs 3 s — unless you're on nitro or shielded: then it's a takedown.
 
-**Progression:** player level (XP from score), coins (lights, chains, checkpoints, missions, level-ups), three rotating missions with escalating goals, and a garage of five cars (Aero, Vector, Apex, Torque, Zenith) with distinct speed / handling / nitro stats.
+**World:** every checkpoint drives into a new zone — Coast, Desert Dusk, Pine Forest, Neon City (night, headlights, street lamps), Snowfield, Volcano.
+
+**Progression:** XP/levels, coins, three rotating missions, a garage of five cars (Aero, Vector, Apex, Torque, Zenith) with speed/handling/nitro tuning (5 levels each) and a paint shop.
 
 ## Deploy (GitHub Pages)
 

@@ -119,7 +119,7 @@ export interface PowerUp {
 }
 
 /** Distance between checkpoints / world zones. */
-export const ZONE_LENGTH = 15000;
+export const ZONE_LENGTH = 10000;
 const ZONE_COUNT = 6;
 
 type Weighted = [PropKind, number][];

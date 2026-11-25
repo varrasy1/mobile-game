@@ -101,6 +101,8 @@ export class Renderer {
 
   private grain: CanvasPattern | null = null;
   private vignette: HTMLCanvasElement | null = null;
+  private glow: HTMLCanvasElement | null = null;
+  private glowKey = '';
   private time = 0;
 
   private trailL: TrailPoint[] = [];
@@ -141,6 +143,26 @@ export class Renderer {
     this.canvas.style.width = `${this.vw}px`;
     this.canvas.style.height = `${this.vh}px`;
     this.vignette = this.makeVignette();
+  }
+
+  /** Accent-coloured radial glow sprite, re-rendered only when the accent changes. */
+  private glowSprite(pal: Palette): HTMLCanvasElement {
+    const key = `${pal.accent[0] | 0},${pal.accent[1] | 0},${pal.accent[2] | 0}`;
+    if (this.glow && key === this.glowKey) return this.glow;
+    const c = this.glow ?? document.createElement('canvas');
+    c.width = c.height = 64;
+    const g = c.getContext('2d');
+    if (g) {
+      g.clearRect(0, 0, 64, 64);
+      const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+      grad.addColorStop(0, `rgba(${key},1)`);
+      grad.addColorStop(1, `rgba(${key},0)`);
+      g.fillStyle = grad;
+      g.fillRect(0, 0, 64, 64);
+    }
+    this.glow = c;
+    this.glowKey = key;
+    return c;
   }
 
   /** Soft radial vignette, rendered once per resize at low resolution. */
@@ -552,14 +574,13 @@ export class Renderer {
       ctx.restore();
     }
     // Orbs and apex arcs glow in the dark.
+    const sprite = this.glowSprite(pal);
     for (const orb of track.orbs) {
       if (orb.taken || orb.x < v.l || orb.x > v.r || orb.y < v.t || orb.y > v.b) continue;
-      const g = ctx.createRadialGradient(orb.x, orb.y, 0, orb.x, orb.y, 16);
-      g.addColorStop(0, css(pal.accent, 0.35 * fx.night));
-      g.addColorStop(1, css(pal.accent, 0));
-      ctx.fillStyle = g;
-      ctx.fillRect(orb.x - 16, orb.y - 16, 32, 32);
+      ctx.globalAlpha = 0.35 * fx.night;
+      ctx.drawImage(sprite, orb.x - 16, orb.y - 16, 32, 32);
     }
+    ctx.globalAlpha = 1;
     // Player headlights.
     ctx.translate(car.x, car.y);
     ctx.rotate(car.angle + fx.drift + Math.PI / 2);
@@ -612,11 +633,9 @@ export class Renderer {
         continue;
       }
       const pulse = 0.5 + 0.5 * Math.sin(time * 4 - o.idx * 0.7);
-      const halo = ctx.createRadialGradient(o.x, o.y, 0, o.x, o.y, 13);
-      halo.addColorStop(0, css(pal.accent, 0.28 + 0.12 * pulse));
-      halo.addColorStop(1, css(pal.accent, 0));
-      ctx.fillStyle = halo;
-      ctx.fillRect(o.x - 13, o.y - 13, 26, 26);
+      ctx.globalAlpha = 0.28 + 0.12 * pulse;
+      ctx.drawImage(this.glowSprite(pal), o.x - 13, o.y - 13, 26, 26);
+      ctx.globalAlpha = 1;
       ctx.fillStyle = css(pal.orb);
       ctx.beginPath();
       ctx.arc(o.x, o.y, 3.2 + pulse * 0.5, 0, Math.PI * 2);
