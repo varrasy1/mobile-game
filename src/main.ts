@@ -1230,7 +1230,9 @@ if (import.meta.env.DEV) {
   Object.assign(window, {
     __flow: {
       car,
-      track,
+      get track() {
+        return track;
+      },
       Car,
       Track,
       progress,
