@@ -106,6 +106,28 @@ export const PAINTS: PaintDef[] = [
   { id: 'titanium', name: 'Titanium', hex: '#A9B1BC', price: 800 },
 ];
 
+/** Neon underglow and tyre-smoke colours (global: apply to every car). */
+export const GLOWS: PaintDef[] = [
+  { id: 'g-cyan', name: 'Cyan Neon', hex: '#29E0FF', price: 600 },
+  { id: 'g-magenta', name: 'Magenta Neon', hex: '#FF3DCB', price: 600 },
+  { id: 'g-lime', name: 'Lime Neon', hex: '#9BFF3D', price: 600 },
+  { id: 'g-amber', name: 'Amber Neon', hex: '#FFB23D', price: 700 },
+  { id: 'g-violet', name: 'Violet Neon', hex: '#9A5BFF', price: 900 },
+  { id: 'g-red', name: 'Red Neon', hex: '#FF3B3B', price: 900 },
+];
+
+export const SMOKES: PaintDef[] = [
+  { id: 's-pink', name: 'Pink Smoke', hex: '#FF7AC8', price: 400 },
+  { id: 's-cyan', name: 'Ice Smoke', hex: '#6FE7FF', price: 400 },
+  { id: 's-gold', name: 'Gold Smoke', hex: '#FFC861', price: 400 },
+  { id: 's-violet', name: 'Violet Smoke', hex: '#B48CFF', price: 500 },
+  { id: 's-black', name: 'Black Smoke', hex: '#24272D', price: 500 },
+];
+
+export function styleById(id: string | null): PaintDef | undefined {
+  return id ? [...GLOWS, ...SMOKES].find((p) => p.id === id) : undefined;
+}
+
 export function paintById(id: string | null): PaintDef | undefined {
   return id ? PAINTS.find((p) => p.id === id) : undefined;
 }
@@ -135,6 +157,9 @@ interface Saved {
   nextSeq: number;
   tuning: Record<string, CarTune>;
   paints: string[];
+  style: string[];
+  glow: string | null;
+  smoke: string | null;
 }
 
 export class Progress {
@@ -145,6 +170,10 @@ export class Progress {
   missions: Mission[] = [];
   tuning: Record<string, CarTune> = {};
   paints: string[] = [];
+  /** Owned underglow / smoke items and the active ones. */
+  style: string[] = [];
+  glow: string | null = null;
+  smoke: string | null = null;
   private nextSeq = 0;
 
   constructor() {
@@ -161,6 +190,9 @@ export class Progress {
         this.nextSeq = Math.max(0, Math.floor(s.nextSeq ?? 0));
         if (s.tuning && typeof s.tuning === 'object') this.tuning = s.tuning;
         if (Array.isArray(s.paints)) this.paints = s.paints.filter((x) => typeof x === 'string');
+        if (Array.isArray(s.style)) this.style = s.style.filter((x) => typeof x === 'string');
+        if (typeof s.glow === 'string' && this.style.includes(s.glow)) this.glow = s.glow;
+        if (typeof s.smoke === 'string' && this.style.includes(s.smoke)) this.smoke = s.smoke;
       }
     } catch {
       /* fresh profile */
@@ -193,6 +225,9 @@ export class Progress {
       nextSeq: this.nextSeq,
       tuning: this.tuning,
       paints: this.paints,
+      style: this.style,
+      glow: this.glow,
+      smoke: this.smoke,
     };
     try {
       localStorage.setItem(KEY, JSON.stringify(s));
@@ -274,6 +309,22 @@ export class Progress {
     this.paints.push(paintId);
     this.save();
     return true;
+  }
+
+  buyStyle(id: string): boolean {
+    const p = styleById(id);
+    if (!p || this.style.includes(id) || this.coins < p.price) return false;
+    this.coins -= p.price;
+    this.style.push(id);
+    this.save();
+    return true;
+  }
+
+  /** Activates an owned underglow / smoke item (null = off / default). */
+  setStyle(kind: 'glow' | 'smoke', id: string | null): void {
+    if (id && !this.style.includes(id)) return;
+    this[kind] = id;
+    this.save();
   }
 
   select(id: string): void {

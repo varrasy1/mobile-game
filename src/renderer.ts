@@ -2,7 +2,7 @@ import { BASE_SPEED, MAX_SPEED, TOP_SPEED, type Car } from './car';
 import { CARS, drawCar as drawCarModel, type CarModel } from './cars';
 import { drawHeadlights, drawProp, drawPropLight, type PropDrawOptions } from './props';
 import { css, type Palette, type Theme } from './theme';
-import { NODE_SPACING, type Track } from './track';
+import { NODE_SPACING, turnInPoint, type Track } from './track';
 
 const DPR_CAP = 2.5;
 const TRAIL_LIFE = 1.6;
@@ -69,6 +69,8 @@ export interface FrameFx {
   nitro: number;
   /** Visual drift yaw added to the car's facing (radians). */
   drift: number;
+  /** 0…1 jump height. */
+  air: number;
   /** Ghost car model id. */
   ghostModel?: CarModel;
   /** 0…1 darkness of the current world zone. */
@@ -202,7 +204,11 @@ export class Renderer {
   // ───────────────────────── camera ─────────────────────────
 
   /** Track-up chase camera: the road ahead always points up the screen. */
+  /** Last known car speed (for speed-aware turn-in markers). */
+  private speed = 300;
+
   updateCamera(dt: number, car: Car, boost: number, track: Track, s: number): void {
+    this.speed = car.speed;
     const p = track.poseAt(s + 50) ?? track.poseAt(s);
     const roadAngle = p ? p.angle : Math.atan2(car.vy, car.vx);
     const look = 70 + car.speed * 0.16;
@@ -247,6 +253,14 @@ export class Renderer {
   // ───────────────────────── effects ─────────────────────────
 
   private paint: string | null = null;
+  private smokeColor: string | null = null;
+  private underglow: string | null = null;
+
+  /** Garage style items: neon underglow and tyre-smoke colour (hex or null). */
+  setStyle(underglow: string | null, smoke: string | null): void {
+    this.underglow = underglow;
+    this.smokeColor = smoke;
+  }
 
   setModel(model: CarModel, paint: string | null = null): void {
     this.model = model;
@@ -341,6 +355,16 @@ export class Renderer {
 
   kick(amount: number): void {
     this.shake = Math.min(1, this.shake + amount);
+  }
+
+  /** Snap the camera to the car on the next frame and drop old trails (course swap). */
+  resetCamera(): void {
+    this.cameraReady = false;
+    this.cvx = this.cvy = 0;
+    this.trailL.length = 0;
+    this.trailR.length = 0;
+    this.dust.length = 0;
+    this.ripples.length = 0;
   }
 
   /** Clears transient effects (new run). */
@@ -583,6 +607,58 @@ export class Renderer {
     ctx.restore();
   }
 
+  /** Full-width jump ramp in local frame (travel toward −y). */
+  private drawRamp(pal: Palette, time: number, used: boolean): void {
+    const { ctx } = this;
+    const w = 150;
+    const depth = 46;
+    ctx.globalAlpha = used ? 0.55 : 1;
+    // Shadow cast past the lip.
+    ctx.fillStyle = css(pal.roadShadow, 1.4);
+    ctx.fillRect(-w / 2, -depth / 2 - 7, w, 7);
+    // Ramp deck: darker at the foot, lit at the lip.
+    const g = ctx.createLinearGradient(0, depth / 2, 0, -depth / 2);
+    g.addColorStop(0, css(pal.road));
+    g.addColorStop(1, css(pal.edge, 0.85));
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.roundRect(-w / 2, -depth / 2, w, depth, 4);
+    ctx.fill();
+    // Hazard stripes on the lip.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(-w / 2, -depth / 2, w, 9);
+    ctx.clip();
+    ctx.fillStyle = css(pal.accent);
+    for (let x = -w / 2 - 12; x < w / 2 + 12; x += 16) {
+      ctx.beginPath();
+      ctx.moveTo(x, -depth / 2 + 9);
+      ctx.lineTo(x + 8, -depth / 2 + 9);
+      ctx.lineTo(x + 17, -depth / 2);
+      ctx.lineTo(x + 9, -depth / 2);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+    // Animated arrows up the deck.
+    ctx.strokeStyle = css(pal.accent);
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (let i = 0; i < 2; i++) {
+      const y = 12 - i * 12;
+      ctx.globalAlpha = (used ? 0.4 : 1) * (0.35 + 0.65 * Math.max(0, Math.sin(time * 8 - i * 1.4)));
+      for (const x of [-40, 0, 40]) {
+        ctx.beginPath();
+        ctx.moveTo(x - 9, y + 6);
+        ctx.lineTo(x, y - 3);
+        ctx.lineTo(x + 9, y + 6);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
   private drawPads(track: Track, pal: Palette, v: View, time: number): void {
     const { ctx } = this;
     for (const pad of track.pads) {
@@ -590,6 +666,11 @@ export class Renderer {
       ctx.save();
       ctx.translate(pad.x, pad.y);
       ctx.rotate(pad.angle + Math.PI / 2);
+      if (pad.ramp) {
+        this.drawRamp(pal, time, pad.used);
+        ctx.restore();
+        continue;
+      }
       const dim = pad.used ? 0.3 : 1;
       ctx.fillStyle = css(pal.accent, 0.09 * dim);
       ctx.beginPath();
@@ -768,6 +849,31 @@ export class Renderer {
     spline(ctx, rx, ry, true, false);
     ctx.stroke();
 
+    // Turn-in markers: a row of chevrons across the road where a full-lock
+    // drift should start, pointing into the corner.
+    for (const c of track.corners) {
+      if (c.angle < 0.6) continue;
+      const i = Math.round((turnInPoint(c, this.speed) - nodes[0].s) / NODE_SPACING);
+      if (i < a || i > b) continue;
+      const p = nodes[i];
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.heading);
+      ctx.strokeStyle = css(pal.accent, 0.7);
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      const dir = c.side;
+      for (const x of [-48, -24, 0, 24, 48]) {
+        ctx.beginPath();
+        ctx.moveTo(x - dir * 5, -7);
+        ctx.lineTo(x + dir * 4, 0);
+        ctx.lineTo(x - dir * 5, 7);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
     // Corner kerbs: red/white blocks on both edges of every corner.
     const n0 = nodes[0].s;
     ctx.lineCap = 'butt';
@@ -833,11 +939,13 @@ export class Renderer {
     if (!this.dust.length) return;
     const { ctx } = this;
     ctx.save();
-    ctx.fillStyle = css(pal.dust, 1 / pal.dust[3]);
+    const base = css(pal.dust, 1 / pal.dust[3]);
     for (const p of this.dust) {
       if (p.spark) continue;
       const life = 1 - p.age / (p.smoke ? SMOKE_LIFE : DUST_LIFE);
-      ctx.globalAlpha = p.smoke ? pal.dust[3] * 0.9 * life * life : pal.dust[3] * life;
+      const tinted = p.smoke && this.smokeColor;
+      ctx.fillStyle = tinted ? (this.smokeColor as string) : base;
+      ctx.globalAlpha = tinted ? 0.34 * life * life : p.smoke ? pal.dust[3] * 0.9 * life * life : pal.dust[3] * life;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size * (1 + (1 - life) * (p.smoke ? 3.2 : 1.5)), 0, Math.PI * 2);
       ctx.fill();
@@ -914,8 +1022,18 @@ export class Renderer {
   private drawCar(car: Car, pal: Palette, glow: number, fx: FrameFx): void {
     const { ctx } = this;
     const angle = car.angle + fx.drift;
+    if (fx.air > 0.01) {
+      // Detached ground shadow while airborne.
+      ctx.save();
+      ctx.fillStyle = css(pal.carShadow, 0.7 * (1 - fx.air * 0.5));
+      ctx.beginPath();
+      ctx.ellipse(car.x + 8 * fx.air, car.y + 12 * fx.air, 12 * (1 - 0.2 * fx.air), 22 * (1 - 0.2 * fx.air), angle + Math.PI / 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
     ctx.save();
     ctx.translate(car.x, car.y);
+    if (fx.air > 0.01) ctx.scale(1 + 0.45 * fx.air, 1 + 0.45 * fx.air);
     ctx.rotate(angle + Math.PI / 2);
     drawCarModel(ctx, this.model, {
       pal,
@@ -926,6 +1044,7 @@ export class Renderer {
       worldAngle: angle,
       pxScale: this.dpr * this.scale,
       ...(this.paint ? { paint: this.paint } : {}),
+      ...(this.underglow ? { underglow: this.underglow } : {}),
     });
     ctx.restore();
   }

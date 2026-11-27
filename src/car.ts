@@ -34,7 +34,7 @@ export class Car {
   }
 
   /** Tightest drift radius (px): the same at every speed, so corners are about timing. */
-  minRadius = 122;
+  minRadius = 95;
 
   get turnRate(): number {
     return Math.max(1.6, this.speed / this.minRadius);

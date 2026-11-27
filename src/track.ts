@@ -1,18 +1,24 @@
 /**
- * Procedural endless ribbon track.
+ * Procedural endless course.
  *
- * The centreline is a list of spine nodes spaced exactly NODE_SPACING apart,
- * produced by integrating a smooth curvature profile. The heading θ is
- * measured relative to "up" (−Y) and hard-clamped to ±0.44π, so every step
- * moves the road strictly upward (cos θ > 0): the centreline can never
- * self-intersect or fold back. Rendering and sampling interpolate the nodes
- * with uniform Catmull-Rom splines.
+ * The centreline is a list of spine nodes spaced exactly NODE_SPACING apart:
+ * straights joined by constant-radius corners of random angle (kinks to 180°
+ * hairpins). Every candidate segment is simulated first and only committed if
+ * it keeps a full road-plus-run-off clearance from the live course, so the
+ * road can wander in any direction and still never overlap itself.
+ * Rendering and sampling interpolate the nodes with Catmull-Rom splines.
  */
 
 export const NODE_SPACING = 14;
 export const ROAD_HALF_WIDTH = 84;
 export const NODES_AHEAD = 260;
-export const PRUNE_BEHIND = 450;
+export const PRUNE_BEHIND = 1700;
+/** Run-off (gravel) width beyond each road edge. */
+export const RUNOFF = 40;
+/** Minimum centre-line distance between two non-adjacent parts of the course. */
+const CLEARANCE = 2 * (84 + RUNOFF) + 6;
+/** Path distance below which two course points count as neighbours. */
+const NEIGHBOUR = CLEARANCE * 1.5;
 
 const APEX_HALF_NODES = 4; // 9 nodes → 8 × 14 = 112px ≈ 110px span
 export const APEX_INSET = 7;
@@ -88,6 +94,8 @@ export interface BoostPad {
   angle: number;
   lat: number;
   used: boolean;
+  /** Jump ramp instead of a boost strip. */
+  ramp: boolean;
 }
 
 export type PropKind = 'tree' | 'rock' | 'bush' | 'pine' | 'snowpine' | 'cactus' | 'building' | 'lamp' | 'ember' | 'palm';
@@ -180,16 +188,31 @@ const SCENERY_LAG_NODES = 150;
 
 type SegmentType = 'corner' | 'straight';
 
-/** Centre-line radius of a standard 90° corner and of a fast sweeper. */
-export const CORNER_RADIUS = 125;
-const SWEEPER_RADIUS = 175;
-
 export interface Corner {
   s0: number;
   s1: number;
   /** +1 = turns right, −1 = left. */
   side: number;
+  /** Turn angle (radians, unsigned) and centre-line radius. */
+  angle: number;
+  radius: number;
+  /** Suggested turn-in point (arc length) for a full-lock drift. */
+  turnIn: number;
 }
+
+/** Approximate path radius of a car holding full lock (used for turn-in hints). */
+export const DRIFT_LINE_RADIUS = 98;
+
+/**
+ * Where to start holding for a corner at the given speed: the geometric
+ * turn-in, moved earlier by the distance the car covers while steering and
+ * slip build up (measured ≈ 0.25 s of travel).
+ */
+export function turnInPoint(c: Corner, speed: number): number {
+  return Math.max(c.s0 - 240, c.turnIn - speed * 0.25);
+}
+
+type CornerKind = 'kink' | 'standard' | 'tight' | 'hairpin';
 
 interface Segment {
   type: SegmentType;
@@ -213,6 +236,8 @@ function mulberry32(seed: number): () => number {
 }
 
 export class Track {
+  /** Diagnostics: how often the generator had to fall back. */
+  static fallbacks = 0;
   readonly nodes: TrackNode[] = [];
   readonly apexes: ApexZone[] = [];
   readonly corners: Corner[] = [];
@@ -281,56 +306,203 @@ export class Track {
    * from "up" a corner turns left or right; from a sideways run the only
    * corner turns back up. Corner + corner gives a chicane.
    */
-  private nextSegment(): void {
-    const r = this.rng;
-    const h = this.heading;
-    const here = this.lastS;
-    const prev = this.lastType;
-    const node = this.nodes[this.nodes.length - 1];
+  /** 0…1 difficulty from distance travelled since the course began. */
+  private get difficulty(): number {
+    return Math.min(1, this.lastS / 30000);
+  }
 
-    let type: SegmentType;
-    if (prev === 'corner') type = Math.abs(h) > 0.1 && r() < 0.35 ? 'corner' : 'straight';
-    else type = 'corner';
+  /** Simulates a segment from the current end of the course. */
+  private simulate(K: number, L: number, extra = 0): { x: number; y: number }[] {
+    const last = this.nodes[this.nodes.length - 1];
+    let x = last.x;
+    let y = last.y;
+    let h = this.heading;
+    const pts: { x: number; y: number }[] = [];
+    const steps = Math.ceil(L / NODE_SPACING);
+    for (let i = 0; i < steps; i++) {
+      const mid = h + (K * NODE_SPACING) / 2;
+      h += K * NODE_SPACING;
+      x += Math.sin(mid) * NODE_SPACING;
+      y -= Math.cos(mid) * NODE_SPACING;
+      pts.push({ x, y });
+    }
+    // Escape check: a short straight after the segment must be clear too.
+    for (let i = 0; i < Math.ceil(extra / NODE_SPACING); i++) {
+      x += Math.sin(h) * NODE_SPACING;
+      y -= Math.cos(h) * NODE_SPACING;
+      pts.push({ x, y });
+    }
+    return pts;
+  }
 
-    if (type === 'straight') {
-      const up = Math.abs(h) < 0.1;
-      const L = up ? 240 + r() * 420 : 150 + r() * 260;
-      this.lastType = type;
-      this.seg = { type, K: 0, L, pos: 0, endHeading: h };
-      if (up && L > 430 && here > 1600 && r() < 0.5) {
-        this.pending.push({ s: here + L * 0.45, lat: (r() - 0.5) * 50, kind: 'pad', idx: 0 });
+  /**
+   * True if every simulated point keeps CLEARANCE from the committed course.
+   * Points that are close *along the road* (path distance < NEIGHBOUR) are
+   * neighbours, not overlaps, and are skipped; everything else must be clear.
+   */
+  private clear(pts: { x: number; y: number }[]): boolean {
+    const n = this.nodes;
+    const end = n[n.length - 1].s;
+    const c2 = CLEARANCE * CLEARANCE;
+    for (let i = 0; i < pts.length; i++) {
+      const t = (i + 1) * NODE_SPACING;
+      const p = pts[i];
+      for (let j = n.length - 1; j >= 0; j--) {
+        const a = n[j];
+        if (t + (end - a.s) < NEIGHBOUR) continue;
+        const dx = p.x - a.x;
+        const dy = p.y - a.y;
+        if (dx * dx + dy * dy < c2) return false;
       }
-      return;
     }
+    return true;
+  }
 
-    // Corner direction: sideways runs must turn back up; from "up" pick a
-    // side, leaning back toward the course's centre line.
-    let sign: number;
-    if (h > 0.1) sign = -1;
-    else if (h < -0.1) sign = 1;
-    else {
-      const drift = node.x / 900;
-      sign = r() < 0.5 - Math.max(-0.35, Math.min(0.35, drift)) ? 1 : -1;
+  /** Smallest non-neighbour distance from the points to the course. */
+  private minGap(pts: { x: number; y: number }[]): number {
+    const n = this.nodes;
+    const end = n[n.length - 1].s;
+    let best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const t = (i + 1) * NODE_SPACING;
+      for (let j = n.length - 1; j >= 0; j--) {
+        if (t + (end - n[j].s) < NEIGHBOUR) continue;
+        const d = Math.hypot(pts[i].x - n[j].x, pts[i].y - n[j].y);
+        if (d < best) best = d;
+      }
     }
-    const R = r() < 0.22 ? SWEEPER_RADIUS : CORNER_RADIUS;
-    // Whole number of nodes so the heading lands exactly on 90°.
-    const n = Math.max(4, Math.round((Math.PI / 2) * R / NODE_SPACING));
+    return best;
+  }
+
+  private commitStraight(L: number): void {
+    const r = this.rng;
+    const here = this.lastS;
+    this.lastType = 'straight';
+    this.seg = { type: 'straight', K: 0, L, pos: 0, endHeading: this.heading };
+    // Long straights get a jump ramp or a boost strip.
+    if (here > 1600 && L > 420) {
+      const roll = r();
+      if (roll < 0.45) this.pending.push({ s: here + L * 0.42, lat: 0, kind: 'pad', idx: 1 });
+      else if (roll < 0.8) this.pending.push({ s: here + L * 0.4, lat: (r() - 0.5) * 70, kind: 'pad', idx: 0 });
+    }
+  }
+
+  private commitCorner(sign: number, angle: number, R: number): void {
+    const here = this.lastS;
+    const n = Math.max(3, Math.round((angle * R) / NODE_SPACING));
     const L = n * NODE_SPACING;
-    const K = (Math.PI / 2) / L;
+    const K = angle / L;
+    const h = this.heading;
     this.lastType = 'corner';
-    this.seg = { type: 'corner', K: K * sign, L, pos: 0, endHeading: h + sign * (Math.PI / 2) };
+    // Headings stay continuous (unwrapped) so interpolation never jumps by 2π.
+    this.seg = { type: 'corner', K: K * sign, L, pos: 0, endHeading: h + sign * angle };
+
+    // Turn-in hint: where a full-lock drift line meets the entry straight.
+    // Exit offset of a full-lock arc started d px into the corner is
+    // −(R−r)(1−cos θ) + d·sin θ; zero at d = (R−r)·tan(θ/2). Beyond ~120° the
+    // tangent explodes (a hairpin can't be fixed by timing alone — you feather
+    // the hold), so the angle is capped there.
+    const half = Math.min(angle, (120 * Math.PI) / 180) / 2;
+    const turnIn = Math.max(here - 160, Math.min(here + L * 0.4, here + (R - DRIFT_LINE_RADIUS) * Math.tan(half)));
+    this.corners.push({ s0: here, s1: here + L, side: sign, angle, radius: R, turnIn });
 
     const mid = here + L / 2;
-    this.corners.push({ s0: here, s1: here + L, side: sign });
-    this.pending.push({ s: mid, lat: 0, kind: 'apex', idx: sign });
+    if (angle > 0.5) this.pending.push({ s: mid, lat: 0, kind: 'apex', idx: sign });
     // Light chain on the drift line: outside → apex → outside.
     const span = L / 2 + 90;
     let idx = 0;
     for (let d = -span; d <= span * 0.6; d += 28) {
       const u = d / span;
       const bell = Math.exp(-u * u * 3.2);
-      this.pending.push({ s: mid + d, lat: sign * (-30 + 78 * bell), kind: 'orb', idx: idx++ });
+      this.pending.push({ s: mid + d, lat: sign * (-34 + 92 * bell), kind: 'orb', idx: idx++ });
     }
+  }
+
+  /**
+   * Picks the next segment: a straight, or a randomised corner (kink, standard,
+   * tight or hairpin), sometimes chained straight into another corner (esses).
+   */
+  private nextSegment(): void {
+    const r = this.rng;
+    const h = wrap(this.heading);
+    const d = this.difficulty;
+    const prev = this.lastType;
+
+    // Corner after corner = esses/chicane; more likely as the course hardens.
+    const wantCorner = prev !== 'corner' || r() < 0.25 + 0.25 * d;
+    if (!wantCorner || this.lastS < 900) {
+      const L = this.lastS < 900 ? 700 : r() < 0.18 ? 520 + r() * 380 : 140 + r() * (380 - 160 * d);
+      if (Math.abs(h) < 0.56 * Math.PI && this.clear(this.simulate(0, L, 300))) {
+        this.commitStraight(L);
+        return;
+      }
+    }
+
+    // Candidate corners, tried in random order until one fits.
+    const sideways = Math.abs(Math.abs(h) - Math.PI / 2) < Math.PI / 4;
+    const kinds: [CornerKind, number][] = [
+      ['kink', 0.2],
+      ['standard', 0.42 - 0.1 * d],
+      ['tight', 0.2 + 0.15 * d],
+      ['hairpin', sideways ? 0.18 + 0.1 * d : 0],
+    ];
+    for (let attempt = 0; attempt < 14; attempt++) {
+      let x = r() * kinds.reduce((a, k) => a + k[1], 0);
+      let kind: CornerKind = 'standard';
+      for (const [k, w] of kinds) {
+        x -= w;
+        if (x <= 0) {
+          kind = k;
+          break;
+        }
+      }
+      let angle: number;
+      let R: number;
+      if (kind === 'kink') {
+        angle = (25 + r() * 25) * (Math.PI / 180);
+        R = 150 + r() * 90;
+      } else if (kind === 'standard') {
+        angle = (60 + r() * 45) * (Math.PI / 180);
+        R = 115 + r() * 70;
+      } else if (kind === 'tight') {
+        angle = (105 + r() * 40) * (Math.PI / 180);
+        R = 112 + r() * 26;
+      } else {
+        angle = (165 + r() * 15) * (Math.PI / 180);
+        R = 128 + r() * 24;
+      }
+      // Bias toward turning back "up" when the course leans far over.
+      let sign = r() < 0.5 ? -1 : 1;
+      if (Math.abs(h) > 0.35 * Math.PI && r() < 0.75) sign = -Math.sign(h);
+      const end = wrap(h + sign * angle);
+      if (Math.abs(end) > 0.56 * Math.PI) continue;
+      const L = angle * R;
+      if (!this.clear(this.simulate((sign * angle) / L, L, 420))) continue;
+      this.commitCorner(sign, angle, R);
+      return;
+    }
+    // Fallback: search a wide set of shapes and take the one with the most
+    // room (prefer ones that bring the heading back toward "up").
+    Track.fallbacks++;
+    let best: { score: number; apply: () => void } | null = null;
+    for (const sign of [-1, 1]) {
+      for (const deg of [15, 30, 45, 60, 90, 120, 150, 180]) {
+        for (const R of [125, 170, 230]) {
+          const angle = (deg * Math.PI) / 180;
+          const end = wrap(h + sign * angle);
+          const L = angle * R;
+          const gap = this.minGap(this.simulate((sign * angle) / L, L, 420));
+          const score = Math.min(gap, CLEARANCE + 40) - Math.abs(end) * 40;
+          if (!best || score > best.score) best = { score, apply: () => this.commitCorner(sign, angle, R) };
+        }
+      }
+    }
+    for (const L of [140, 280]) {
+      const gap = this.minGap(this.simulate(0, L, 420));
+      const score = Math.min(gap, CLEARANCE + 40) - Math.abs(h) * 40;
+      if (!best || score > best.score) best = { score, apply: () => this.commitStraight(L) };
+    }
+    if (best) best.apply();
   }
 
   private curvatureAtSegment(): number {
@@ -391,7 +563,7 @@ export class Track {
       const x = pose.x + pose.nx * p.lat;
       const y = pose.y + pose.ny * p.lat;
       if (p.kind === 'orb') this.orbs.push({ x, y, s: p.s, idx: p.idx, taken: false, age: -1 });
-      else if (p.kind === 'pad') this.pads.push({ x, y, s: p.s, angle: pose.angle, lat: p.lat, used: false });
+      else if (p.kind === 'pad') this.pads.push({ x, y, s: p.s, angle: pose.angle, lat: p.lat, used: false, ramp: p.idx === 1 });
       else this.powerups.push({ x, y, s: p.s, lat: p.lat, kind: p.idx as PowerKind, taken: false, age: -1 });
     }
   }
@@ -581,6 +753,10 @@ export class Track {
     const t = Math.max(0, Math.min(1, f - i));
     return n[i].k + (n[i + 1].k - n[i].k) * t;
   }
+}
+
+function wrap(a: number): number {
+  return Math.atan2(Math.sin(a), Math.cos(a));
 }
 
 function pruneBefore<T extends { s: number }>(arr: T[], s: number): void {

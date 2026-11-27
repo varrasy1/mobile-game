@@ -665,6 +665,43 @@
       #hud:not(.playing) #nitro {
         pointer-events: none;
       }
+      .modes {
+        display: flex;
+        gap: 4px;
+        margin-top: 10px;
+        padding: 3px;
+        border-radius: 999px;
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 25%, transparent);
+        pointer-events: auto;
+      }
+      .modes button {
+        padding: 7px 16px;
+        border: 0;
+        border-radius: 999px;
+        background: none;
+        color: var(--fg);
+        font: inherit;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.24em;
+        opacity: 0.55;
+        cursor: pointer;
+      }
+      .modes button.on {
+        background: var(--fg);
+        color: var(--bg);
+        opacity: 1;
+      }
+      #title.hidden .modes {
+        pointer-events: none;
+      }
+      #mode-info {
+        min-height: 1em;
+        font-size: 10px;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        opacity: 0.6;
+      }
       #title .garage-btn {
         position: absolute;
         bottom: calc(env(safe-area-inset-bottom) + 34px);
@@ -964,6 +1001,59 @@
         outline-offset: 2px;
         opacity: 1;
       }
+      #g-perk {
+        margin-top: 10px;
+        max-width: min(320px, 86vw);
+        font-size: 10px;
+        letter-spacing: 0.08em;
+        line-height: 1.5;
+        text-align: center;
+        opacity: 0.8;
+      }
+      #g-perk b {
+        display: block;
+        margin-bottom: 2px;
+        color: var(--accent);
+        font-size: 9px;
+        letter-spacing: 0.26em;
+      }
+      #g-style {
+        margin-top: 14px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+      }
+      .g-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .g-row > span {
+        width: 46px;
+        font-size: 9px;
+        letter-spacing: 0.22em;
+        opacity: 0.6;
+      }
+      .g-row > div {
+        display: flex;
+        gap: 7px;
+      }
+      #g-style .sw {
+        width: 20px;
+        height: 20px;
+        box-shadow: 0 0 8px var(--c), inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+      }
+      #g-style .sw.factory {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 40%, transparent);
+      }
+      #g-style-name {
+        min-height: 1em;
+        font-size: 9px;
+        letter-spacing: 0.24em;
+        text-transform: uppercase;
+        opacity: 0.55;
+      }
       #g-paint-name {
         margin-top: 8px;
         min-height: 1em;
@@ -989,6 +1079,11 @@
       <h1>FLOWLINE</h1>
       <div id="best" hidden></div>
       <ul id="missions" class="missions" aria-label="Missions"></ul>
+      <div class="modes">
+        <button type="button" id="mode-endless">ENDLESS</button>
+        <button type="button" id="mode-daily">DAILY</button>
+      </div>
+      <div id="mode-info"></div>
       <div id="prompt">Tap anywhere to drive</div>
       <button type="button" class="garage-btn garage-open">GARAGE</button>
     </div>
@@ -996,7 +1091,7 @@
     <div id="drift" class="center-note"></div>
     <div id="banner" class="center-note"></div>
     <div id="hint" class="center-note">
-      Hold left / right to drift through corners<br />Release when the nose points down the next straight
+      Turn in at the arrows · hold left / right to drift<br />Release when the nose points down the next straight
     </div>
     <div id="results" aria-live="polite"></div>
 
@@ -1057,9 +1152,15 @@
       <div id="g-count"></div>
       <div id="g-name"></div>
       <div id="g-tag"></div>
+      <div id="g-perk"></div>
       <div id="g-stats"></div>
       <div id="g-paints" aria-label="Paint"></div>
       <div id="g-paint-name"></div>
+      <div id="g-style">
+        <div class="g-row"><span>NEON</span><div id="g-glows"></div></div>
+        <div class="g-row"><span>SMOKE</span><div id="g-smokes"></div></div>
+        <div id="g-style-name"></div>
+      </div>
       <button id="g-action" type="button">SELECT</button>
     </div>
 
